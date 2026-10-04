@@ -8,6 +8,8 @@ description = "cev (Calibrated Enum Verdicts) in the browser: the Qwen3 engine a
 readme.workspace = true
 keywords.workspace = true
 categories = ["artificial-intelligence", "wasm"]
+# Built from this repo for web/; not on crates.io for now.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
