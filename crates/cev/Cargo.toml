@@ -1,0 +1,51 @@
+[package]
+name = "cev-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cev (Calibrated Enum Verdicts): typed System One decisions in Rust. Match on an enum the model picked."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["http"]
+http = ["dep:reqwest"]
+local = ["dep:cev-runtime", "dep:tokio"]
+# Metal for the examples' in-process engine.
+metal = ["cev-model/metal"]
+
+# `cev` is taken on crates.io; the library keeps the name so `cev::Choice` works.
+[lib]
+name = "cev"
+
+[package.metadata.docs.rs]
+features = ["local"]
+
+[[example]]
+name = "router"
+required-features = ["local"]
+
+[[test]]
+name = "typed"
+required-features = ["local"]
+
+[dependencies]
+cev-core.workspace = true
+cev-derive.workspace = true
+cev-runtime = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+cev-model.workspace = true
+anyhow.workspace = true
+cev-runtime.workspace = true
+cev-server.workspace = true
+axum.workspace = true

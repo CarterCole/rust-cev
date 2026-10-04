@@ -1,0 +1,9 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+training/.venv
+training/ckpt
+__pycache__/
+/web/pkg
+/web/models

@@ -1,0 +1,22 @@
+[package]
+name = "cev-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cev (Calibrated Enum Verdicts) in the browser: the Qwen3 engine and decision runtime compiled to WebAssembly."
+readme.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "wasm"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cev-core.workspace = true
+cev-model.workspace = true
+cev-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"

@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cev in the browser</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f5f1; --panel: #fff; --ink: #1c1b18; --muted: #6d6a62; --line: #e2dfd6;
+    --accent: #2f5fd0; --accent-ink: #fff; --bar: #c9d6f5; --good: #1e7d4f; --bad: #b3372c;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15151a; --panel: #1e1f26; --ink: #ecebe6; --muted: #9a988f; --line: #33343d;
+      --accent: #7da0f5; --accent-ink: #10131c; --bar: #33457a; --good: #5fd09a; --bad: #f08a7e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  p { margin: 0; }
+  .lede { color: var(--muted); margin: 4px 0 16px; max-width: 70ch; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
+  @media (max-width: 860px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+  .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .grow { flex: 1; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  textarea, select {
+    width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px; font: 13px/1.45 var(--mono);
+  }
+  select { width: auto; font-family: inherit; }
+  textarea { resize: vertical; }
+  button {
+    font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .pill { font-size: 13px; padding: 3px 10px; border-radius: 99px; border: 1px solid var(--line); font-family: var(--mono); }
+  progress { width: 100%; height: 8px; margin-top: 10px; accent-color: var(--accent); }
+  .answer + .answer { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 14px; }
+  .answer .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+  .answer .qid { font-family: var(--mono); font-weight: 600; }
+  .answer .verdict { font-weight: 600; }
+  .opt {
+    display: grid; grid-template-columns: minmax(0, 1fr) 54px; gap: 8px; align-items: center; width: 100%;
+    position: relative; text-align: left; margin-top: 4px; padding: 5px 8px; overflow: hidden; background: none;
+  }
+  .opt .fill { position: absolute; inset: 0 auto 0 0; background: var(--bar); opacity: .7; }
+  .opt span { position: relative; overflow-wrap: anywhere; }
+  .opt .pct { text-align: right; font-family: var(--mono); font-size: 13px; }
+  .opt.top { border-color: var(--accent); }
+  .opt.labeled { border-color: var(--good); box-shadow: inset 3px 0 var(--good); }
+  .note { font-size: 13px; margin-top: 6px; color: var(--muted); }
+  .error { color: var(--bad); font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left; font-family: var(--mono); }
+  .on { color: var(--good); font-weight: 600; }
+  pre { font: 12px/1.5 var(--mono); margin: 8px 0 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>cev in the browser</h1>
+  <p class="lede">Typed, calibrated decisions in one forward pass. The engine, the decision log and the online
+    learner are the Rust crates compiled to WebAssembly; nothing leaves this tab.</p>
+
+  <section class="panel">
+    <div class="row">
+      <span class="pill" id="backend">starting…</span>
+      <span class="muted small grow" id="backend-note"></span>
+      <button id="load-q8" hidden>Load Qwen3-0.6B int8</button>
+      <button id="load">Load Qwen3-0.6B</button>
+    </div>
+    <p class="muted small" id="load-note" style="margin-top:8px">The real model is a 1.5 GB download (cached afterwards)
+      and needs about 3 GB of memory and a desktop browser. Until then answers come from a keyword-overlap stub.</p>
+    <progress id="bar" max="1" value="0" hidden></progress>
+    <div class="error" id="load-error"></div>
+  </section>
+
+  <div class="cols">
+    <section class="panel">
+      <div class="row">
+        <h2 class="grow" style="margin:0">Request</h2>
+        <select id="preset" aria-label="Example"></select>
+      </div>
+      <label for="state">State (text or JSON)</label>
+      <textarea id="state" rows="6" spellcheck="false"></textarea>
+      <label for="questions">Questions</label>
+      <textarea id="questions" rows="16" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="decide">Decide</button>
+        <span class="muted small">debias</span>
+        <select id="debias" aria-label="Debias">
+          <option>calibrate</option><option>full</option><option>permute</option><option>none</option>
+        </select>
+        <span class="muted small grow">“full” also averages option rotations: better, about 4× slower here.</span>
+      </div>
+      <div class="error" id="error"></div>
+    </section>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>Answers</h2>
+        <div id="answers"><p class="muted">Press Decide. Then click the option that was actually right to send it
+          back as a label.</p></div>
+        <p class="note" id="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Online learning</h2>
+        <p class="small muted">Each task gets a small adapter trained from labels. It is served only once it beats
+          the base model on labels it had not seen yet.</p>
+        <div class="scroll" style="margin-top:10px">
+          <table>
+            <thead><tr><th>task</th><th>labels</th><th>T</th><th>base loss</th><th>adapted loss</th><th>adapter</th><th></th></tr></thead>
+            <tbody id="tasks"><tr><td colspan="7" class="muted" style="font-family:inherit">No labels yet.</td></tr></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="teach">Teach a severity scale</button>
+          <button id="export">Export labels (NDJSON)</button>
+        </div>
+        <p class="note">Teach: 21 labelled tickets one by one, then 9 held-out tickets scored by the base model and by
+          the adapter.</p>
+        <pre id="teach-log"></pre>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const n = Object.assign(document.createElement(tag), props);
+  n.append(...kids);
+  return n;
+};
+
+// --- worker RPC ---
+const worker = new Worker('worker.js', { type: 'module' });
+const pending = new Map();
+let seq = 0;
+const call = (op, ...args) =>
+  new Promise((resolve, reject) => {
+    pending.set(++seq, { resolve, reject });
+    worker.postMessage({ id: seq, op, args });
+  });
+worker.onmessage = ({ data }) => {
+  if (data.progress) return onProgress(data.progress);
+  const p = pending.get(data.id);
+  pending.delete(data.id);
+  if (data.error !== undefined) p.reject(new Error(data.error));
+  else p.resolve(data.result);
+};
+worker.onerror = (e) => {
+  $('load-error').textContent = `Worker failed: ${e.message || 'could not start (run scripts/build_web.sh first?)'}`;
+};
+
+// --- examples ---
+const PRESETS = {
+  'Support ticket': {
+    state: { ticket: 'The app crashes when I tap Log in. I was charged twice this month and want one payment back.' },
+    questions: {
+      team: {
+        type: 'choice',
+        instructions: 'Which team should handle this ticket?',
+        criteria: { billing: 'Payments, invoices, refunds', tech: 'Bugs, crashes, error messages', sales: 'Pricing and upgrades' },
+      },
+      refund: { type: 'noul', instructions: 'Is the user asking for a refund?' },
+      severity: {
+        type: 'score',
+        instructions: 'How severe is the problem for the user?',
+        criteria: ['Cosmetic; no impact', 'Degraded, workaround exists', 'Blocking; no workaround'],
+      },
+    },
+  },
+  'Agent guardrail': {
+    state: {
+      user_request: 'Clean up the old build artifacts in the repo.',
+      proposed_tool_call: { tool: 'shell', command: 'rm -rf / --no-preserve-root' },
+    },
+    questions: {
+      destructive: { type: 'noul', instructions: 'Could this tool call destroy data outside what the user asked for?' },
+      action: {
+        type: 'choice',
+        instructions: 'What should the agent runtime do with this tool call?',
+        criteria: { allow: 'Run it', ask: 'Ask the user to confirm first', deny: 'Refuse to run it' },
+      },
+    },
+  },
+  'Inbox triage': {
+    state: 'Subject: Re: Q3 contract renewal\n\nHi, legal signed off this morning. Can you countersign by Friday so we keep the current pricing? Thanks, Dana',
+    questions: {
+      needs_reply: { type: 'noul', instructions: 'Does this email need a reply from the recipient?' },
+      urgency: { type: 'score', instructions: 'How urgent is it?', criteria: ['Whenever', 'This week', 'Today'] },
+      kind: {
+        type: 'choice',
+        instructions: 'What kind of email is this?',
+        criteria: { action: 'Asks the recipient to do something', fyi: 'Information only', spam: 'Promotion or junk' },
+      },
+    },
+  },
+};
+for (const name of Object.keys(PRESETS)) $('preset').append(el('option', { textContent: name }));
+const usePreset = () => {
+  const p = PRESETS[$('preset').value];
+  $('state').value = typeof p.state === 'string' ? p.state : JSON.stringify(p.state, null, 2);
+  $('questions').value = JSON.stringify(p.questions, null, 2);
+};
+$('preset').onchange = usePreset;
+usePreset();
+
+// --- model ---
+let busy = false;
+const setBusy = (b) => {
+  busy = b;
+  for (const id of ['decide', 'teach', 'load', 'load-q8']) $(id).disabled = b;
+};
+const showModel = (m) => {
+  $('backend').textContent = m.id;
+  $('backend-note').textContent =
+    m.backbone === 'mock' ? 'keyword stub, no weights' : `${m.backbone} · hidden ${m.hidden_size} · wasm CPU`;
+};
+function onProgress({ text, done, total }) {
+  $('bar').hidden = false;
+  if (total) $('bar').value = done / total;
+  else $('bar').removeAttribute('value');
+  const mb = (n) => (n / 2 ** 20).toFixed(0);
+  $('load-note').textContent = total ? `${text} · ${mb(done)} / ${mb(total)} MB` : text;
+}
+const loadModel = async (variant) => {
+  setBusy(true);
+  $('load-error').textContent = '';
+  try {
+    const t = performance.now();
+    showModel(await call('load', 'Qwen/Qwen3-0.6B', variant));
+    $('load-note').textContent = `Loaded in ${((performance.now() - t) / 1000).toFixed(1)} s. The first request with a new state or question set is the slow one; prefixes and calibration are cached after that.`;
+    $('answers').replaceChildren(el('p', { className: 'muted', textContent: 'Model changed: press Decide.' }));
+    $('meta').textContent = '';
+    refreshTasks();
+  } catch (e) {
+    $('load-error').textContent = e.message;
+    $('load-note').textContent = 'Loading failed; back on the stub.';
+    call('model').then(showModel);
+  } finally {
+    $('bar').hidden = true;
+    setBusy(false);
+  }
+};
+$('load').onclick = () => loadModel();
+$('load-q8').onclick = () => loadModel('q8');
+// The int8 copy is only offered when it has been built into web/models/.
+call('has_local', 'Qwen3-0.6B-q8').then((ok) => {
+  $('load-q8').hidden = !ok;
+});
+
+// --- decide + feedback ---
+const pct = (p) => `${(p * 100).toFixed(1)}%`;
+const argmax = (ps) => ps.reduce((best, p, i) => (p > ps[best] ? i : best), 0);
+
+// Options of an answer as [{name, detail, p, label}], in served order.
+function optionsOf(a) {
+  if (a.type === 'noul') {
+    return [
+      { name: 'yes', p: a.noul, label: true },
+      { name: 'no', p: 1 - a.noul, label: false },
+    ];
+  }
+  return Object.entries(a.probabilities).map(([k, p]) =>
+    a.type === 'score' ? { name: k, detail: a.legend[k], p, label: Number(k) } : { name: k, p, label: k },
+  );
+}
+
+function renderAnswer(id, a) {
+  const opts = optionsOf(a);
+  const top = argmax(opts.map((o) => o.p));
+  const verdict =
+    a.type === 'noul' ? `${pct(a.noul)} yes`
+    : a.type === 'choice' ? `${a.choice} · confidence ${a.confidence.toFixed(2)}`
+    : `level ${a.score.toFixed(2)} · confidence ${a.confidence.toFixed(2)}`;
+  const note = el('p', { className: 'note' });
+  if (a.x_cev?.adapted) note.textContent = 'Served by the online adapter.';
+  const rows = opts.map((o, i) => {
+    const b = el('button', { className: i === top ? 'opt top' : 'opt', title: 'Label this as the right answer' },
+      el('span', { className: 'fill' }),
+      el('span', { textContent: o.detail ? `${o.name} · ${o.detail}` : o.name }),
+      el('span', { className: 'pct', textContent: pct(o.p) }));
+    b.firstChild.style.width = pct(o.p);
+    b.onclick = async () => {
+      if (!a.x_cev?.decision_id) return;
+      try {
+        const fb = await call('feedback', { decision_id: a.x_cev.decision_id, label: o.label });
+        for (const r of rows) r.classList.toggle('labeled', r === b);
+        note.textContent = `Labelled “${o.name}” · loss ${fb.served_loss.toFixed(3)} · ${fb.task_examples} label${fb.task_examples === 1 ? '' : 's'} for this task · adapter ${fb.adapter_active ? 'active' : 'not active yet'}`;
+        refreshTasks();
+      } catch (e) {
+        note.textContent = e.message;
+      }
+    };
+    return b;
+  });
+  return el('div', { className: 'answer' },
+    el('div', { className: 'head' },
+      el('span', { className: 'qid', textContent: id }),
+      el('span', { className: 'muted small', textContent: a.type }),
+      el('span', { className: 'grow' }),
+      el('span', { className: 'verdict', textContent: verdict })),
+    ...rows, note);
+}
+
+$('decide').onclick = async () => {
+  $('error').textContent = '';
+  let questions;
+  try {
+    questions = JSON.parse($('questions').value);
+  } catch (e) {
+    $('error').textContent = `Questions are not valid JSON: ${e.message}`;
+    return;
+  }
+  const text = $('state').value;
+  let state = text;
+  try {
+    state = JSON.parse(text);
+  } catch {}
+  setBusy(true);
+  $('decide').textContent = 'Deciding…';
+  try {
+    const t = performance.now();
+    const r = await call('decide', { state, questions, debias: $('debias').value });
+    $('answers').replaceChildren(...Object.entries(r.answers).map(([id, a]) => renderAnswer(id, a)));
+    $('meta').textContent = `${r.model} · ${r.usage.input_tokens} input tokens · ${Math.round(performance.now() - t)} ms · ${r.request_id}`;
+  } catch (e) {
+    $('error').textContent = e.message;
+  } finally {
+    $('decide').textContent = 'Decide';
+    setBusy(false);
+  }
+};
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !busy) $('decide').click();
+});
+
+// --- online learning ---
+async function refreshTasks() {
+  const tasks = await call('tasks');
+  if (!tasks.length) return;
+  $('tasks').replaceChildren(...tasks.map((t) => {
+    const reset = el('button', { textContent: 'reset', className: 'small' });
+    reset.onclick = async () => {
+      await call('reset_task', t.task);
+      reset.closest('tr').remove();
+    };
+    return el('tr', {},
+      el('td', { textContent: t.task.length > 26 ? `${t.task.slice(0, 25)}…` : t.task, title: t.task }),
+      el('td', { textContent: t.examples }),
+      el('td', { textContent: t.temperature.toFixed(2) }),
+      el('td', { textContent: t.base_loss.toFixed(3) }),
+      el('td', { textContent: t.adapted_loss.toFixed(3) }),
+      el('td', { textContent: t.active ? 'serving' : 'shadow', className: t.active ? 'on' : 'muted' }),
+      el('td', {}, reset));
+  }));
+}
+
+const LEVELS = ['Cosmetic; no impact', 'Degraded, workaround exists', 'Blocking; no workaround'];
+const TICKETS = [
+  ['The logo on the invoice PDF is slightly blurry.', 0],
+  ["Typo on the pricing page: 'recieve' should be 'receive'.", 0],
+  ['The settings icon is misaligned by a few pixels on Android.', 0],
+  ['Dark mode makes the footer text a little hard to read.', 0],
+  ['The confirmation email uses the old brand color.', 0],
+  ['Tooltip on the export button has a spelling mistake.', 0],
+  ['Profile avatars look stretched on the team page.', 0],
+  ['The loading spinner is off-center on Safari.', 0],
+  ['Button labels are in title case instead of sentence case.', 0],
+  ['The date in the footer shows last year.', 0],
+  ['CSV export is slow but finishes after a minute or two.', 1],
+  ['Search sometimes misses results; filtering by date manually works.', 1],
+  ['Push notifications are delayed by about 10 minutes.', 1],
+  ["I can't upload images by drag and drop, but the upload button works.", 1],
+  ['The dashboard charts fail to load on Firefox; Chrome is fine.', 1],
+  ['Password reset emails take a while; retrying eventually works.', 1],
+  ['Keyboard shortcuts stopped working, I use the menu instead.', 1],
+  ['Autosave fails sometimes, so I save manually every few minutes.', 1],
+  ['The mobile app logs me out daily; logging back in works.', 1],
+  ['Bulk edit is broken, but editing items one by one still works.', 1],
+  ['The app crashes immediately on launch for every user in our org.', 2],
+  ['Checkout returns a 500 error; no customer can pay right now.', 2],
+  ['All our data disappeared from the dashboard after the update.', 2],
+  ['Login is down for everyone; we are completely locked out.', 2],
+  ['The API returns errors for every request; our integration is dead.', 2],
+  ['Payments are being charged twice and we can’t stop it.', 2],
+  ["The server won't start after the upgrade; production is down.", 2],
+  ["Files uploaded yesterday are corrupted and can't be opened at all.", 2],
+  ['Nobody can send messages; the send button does nothing on any device.', 2],
+  ['The database migration failed and the app shows a blank page.', 2],
+];
+
+$('teach').onclick = async () => {
+  const log = $('teach-log');
+  const debias = $('debias').value;
+  const ask = (ticket, extra) =>
+    call('decide', {
+      state: { ticket },
+      questions: { severity: { type: 'score', instructions: 'How severe is this ticket?', criteria: LEVELS, task: 'demo_severity' } },
+      debias,
+      ...extra,
+    }).then((r) => r.answers.severity);
+  // Interleave the levels so the adapter sees all three early.
+  const train = TICKETS.filter((_, i) => i % 10 < 7).sort((a, b) => TICKETS.indexOf(a) % 10 - TICKETS.indexOf(b) % 10);
+  const test = TICKETS.filter((_, i) => i % 10 >= 7);
+  setBusy(true);
+  try {
+    await call('reset_task', 'demo_severity');
+    let active = false;
+    for (const [i, [ticket, level]] of train.entries()) {
+      log.textContent = `teaching ${i + 1}/${train.length} (debias ${debias})${active ? ' · adapter serving' : ''}`;
+      const a = await ask(ticket);
+      active = (await call('feedback', { decision_id: a.x_cev.decision_id, label: level })).adapter_active;
+      refreshTasks();
+    }
+    let base = 0;
+    let served = 0;
+    for (const [i, [ticket, level]] of test.entries()) {
+      log.textContent = `held-out ${i + 1}/${test.length}`;
+      const a = await ask(ticket, { no_store: true });
+      const p = Object.values(a.probabilities);
+      served += argmax(p) === level;
+      base += argmax(a.x_cev.base_probabilities ?? p) === level;
+    }
+    log.textContent =
+      `held-out accuracy: base ${base}/${test.length}, served ${served}/${test.length}` +
+      (active ? ' (adapter serving)' : ' (adapter stayed in shadow: it did not beat the base model)');
+  } catch (e) {
+    log.textContent = e.message;
+  } finally {
+    setBusy(false);
+  }
+};
+
+$('export').onclick = async () => {
+  const ndjson = await call('export', true);
+  if (!ndjson) {
+    $('teach-log').textContent = 'Nothing to export yet: label an answer first.';
+    return;
+  }
+  const a = el('a', { href: URL.createObjectURL(new Blob([ndjson], { type: 'application/x-ndjson' })), download: 'cev-labels.ndjson' });
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+call('model').then(showModel, (e) => {
+  $('load-error').textContent = e.message;
+});
+</script>
+</body>
+</html>

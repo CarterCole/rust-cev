@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/cev","crates/cev-core", "crates/cev-derive", "crates/cev-model", "crates/cev-runtime", "crates/cev-server", "crates/cev-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/CarterCole/rust-cev"
+readme = "README.md"
+keywords = ["llm", "classification", "inference", "qwen", "candle"]
+categories = ["artificial-intelligence"]
+
+[workspace.dependencies]
+cev-core = { path = "crates/cev-core", version = "0.1.0" }
+cev-model = { path = "crates/cev-model", version = "0.1.0" }
+cev-runtime = { path = "crates/cev-runtime", version = "0.1.0" }
+cev-derive = { path = "crates/cev-derive", version = "0.1.0" }
+cev-server = { path = "crates/cev-server", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v7", "serde", "js"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+# std::time on native, performance.now()/Date in the browser.
+web-time = "1"
+
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+tokenizers = { version = "0.22", default-features = false }
+
+tokio = { version = "1", features = ["full"] }
+axum = "0.8.9"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+async-graphql = "7"
+async-graphql-axum = "7"
+rusqlite = { version = "0.37", features = ["bundled"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+debug = 1

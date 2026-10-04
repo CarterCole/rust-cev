@@ -1,0 +1,19 @@
+[package]
+name = "cev-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types, prompt compiler and answer math for cev (Calibrated Enum Verdicts) typed decisions, plus the Backend trait and a mock."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+sha2.workspace = true
+hex.workspace = true

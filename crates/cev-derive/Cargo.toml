@@ -1,0 +1,18 @@
+[package]
+name = "cev-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "#[derive(Choice)] for cev (Calibrated Enum Verdicts), the typed-decision SDK."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

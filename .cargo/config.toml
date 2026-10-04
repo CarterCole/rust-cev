@@ -1,0 +1,4 @@
+# Browser builds (crates/cev-wasm). No global `+simd128`: candle-core 0.11
+# does not compile with it; the matmul kernels (gemm) enable SIMD themselves.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

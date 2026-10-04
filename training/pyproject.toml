@@ -1,0 +1,12 @@
+[project]
+name = "cev-training"
+version = "0.1.0"
+description = "Offline training for cev: LoRA fine-tuning on exported decisions + feedback."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.51",
+    "peft>=0.15",
+    "safetensors>=0.5",
+    "accelerate>=1.5",
+]

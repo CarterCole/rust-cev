@@ -1,0 +1,43 @@
+[package]
+name = "cev-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The cev (Calibrated Enum Verdicts) server: Jev-compatible REST and GraphQL for typed decisions with feedback and online learning."
+readme.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "web-programming::http-server"]
+
+[[bin]]
+name = "cev"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+metal = ["cev-model/metal"]
+cuda = ["cev-model/cuda"]
+accelerate = ["cev-model/accelerate"]
+
+[dependencies]
+cev-core.workspace = true
+cev-model.workspace = true
+cev-runtime.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
