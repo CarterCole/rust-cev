@@ -15,13 +15,11 @@
 //! each token sees: prefix tokens are causal, each question sees the prefix
 //! plus earlier tokens of its own question only. Several prefixes (e.g. the
 //! state and the content-free calibration prompt) can share one pass. On Metal
-//! attention runs in candle's fused SDPA kernel; on the CPU each layer splits
-//! the new tokens across the cores (see [`Layer::forward`]).
+//! attention runs in candle's fused SDPA kernel.
 
 use crate::quant::{QLinear, SCALE_SUFFIX};
 use candle_core::{DType, Device, Module, Result, Tensor, bail};
 use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, linear_b, rms_norm};
-use rayon::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,6 +142,14 @@ pub struct LayerKv {
     pub v: Tensor,
 }
 
+fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let (b, h, s, d) = x.dims4()?;
+    x.unsqueeze(2)?.expand((b, h, groups, s, d))?.reshape((b, h * groups, s, d))
+}
+
 /// Additive attention mask for `n` new tokens after `past` cached ones.
 /// `segments[i]` is the segment of new token i; a new token sees every cached
 /// token plus earlier new tokens of its own segment. One segment = causal
@@ -178,23 +184,23 @@ impl Attention {
         })
     }
 
-    /// Q, K and V of new tokens x (1, T, hidden), each (1, heads, T, D), with
-    /// Q and K normed and rotated to the tokens' positions.
-    fn qkv(&self, x: &Tensor, rot: &Rotary, pos: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    /// New tokens x (1, T, hidden) attending to `past` K/V (if any) and to
+    /// each other through `mask` (T, past+T). Returns the output and the
+    /// concatenated K/V.
+    fn forward(&self, x: &Tensor, rot: &Rotary, pos: &Tensor, mask: &Tensor, past: Option<&LayerKv>) -> Result<(Tensor, LayerKv)> {
         let (b, t, _) = x.dims3()?;
         let shape = |y: Tensor, h: usize| y.reshape((b, t, h, self.head_dim))?.transpose(1, 2);
         let q = self.q_norm.forward(&shape(self.q.forward(x)?, self.heads)?.contiguous()?)?;
         let k = self.k_norm.forward(&shape(self.k.forward(x)?, self.kv_heads)?.contiguous()?)?;
         let v = shape(self.v.forward(x)?, self.kv_heads)?.contiguous()?;
-        Ok((rot.apply(&q, pos)?, rot.apply(&k, pos)?, v))
-    }
-
-    /// What queries q (1, heads, T, D) read from K/V (1, kv_heads, S, D)
-    /// through `mask` (T, S): (1, T, hidden).
-    fn read(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let (b, _, t, _) = q.dims4()?;
-        let ctx = self.attend(q, k, v, mask)?;
-        self.o.forward(&ctx.transpose(1, 2)?.reshape((b, t, self.heads * self.head_dim))?)
+        let (q, k) = (rot.apply(&q, pos)?, rot.apply(&k, pos)?);
+        let (k, v) = match past {
+            Some(p) => (Tensor::cat(&[&p.k, &k], 2)?, Tensor::cat(&[&p.v, &v], 2)?),
+            None => (k, v),
+        };
+        let ctx = self.attend(&q, &k, &v, mask)?;
+        let out = self.o.forward(&ctx.transpose(1, 2)?.reshape((b, t, self.heads * self.head_dim))?)?;
+        Ok((out, LayerKv { k, v }))
     }
 
     fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
@@ -206,14 +212,11 @@ impl Attention {
             let m = mask.reshape((1, 1, t, s))?.broadcast_as((1, h, t, s))?;
             return candle_nn::ops::sdpa(q, k, v, Some(&m), false, scale as f32, 1.0);
         }
-        // Grouped queries without repeating K/V: the queries of the heads
-        // that share a K/V head are stacked along the token axis instead.
-        let (b, d) = (q.dim(0)?, self.head_dim);
-        let rows = (b, self.kv_heads, h / self.kv_heads * t, d);
-        let scores = (q.reshape(rows)?.matmul(&k.t()?)?.to_dtype(DType::F32)? * scale)?;
-        let scores = scores.reshape((b, h, t, s))?.broadcast_add(&mask.to_dtype(DType::F32)?)?;
+        let g = self.heads / self.kv_heads;
+        let (k, v) = (repeat_kv(k, g)?, repeat_kv(v, g)?);
+        let scores = (q.matmul(&k.t()?)?.to_dtype(DType::F32)? * scale)?.broadcast_add(&mask.to_dtype(DType::F32)?)?;
         let p = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
-        p.reshape((b, self.kv_heads, rows.2, s))?.matmul(v)?.reshape((b, h, t, d))
+        p.matmul(&v)
     }
 }
 
@@ -256,52 +259,6 @@ impl Layer {
     fn mlp_block(&self, x: Tensor) -> Result<Tensor> {
         let h = self.mlp.forward(&self.ln2.forward(&x)?)?;
         x + h
-    }
-
-    /// New tokens x (1, T, hidden) attending to `past` K/V (if any) and to
-    /// each other through `mask` (T, past+T). Returns the layer's output and
-    /// the concatenated K/V.
-    ///
-    /// Given K/V, a token's way through the layer does not depend on the other
-    /// new tokens, so on the CPU the rows are split across the rayon pool:
-    /// each chunk computes its Q/K/V, then each reads from all of K/V and runs
-    /// the MLP. candle's CPU ops are single-threaded or fork once per row,
-    /// which leaves most cores idle; whole chunks of rows keep them busy.
-    fn forward(&self, x: &Tensor, rot: &Rotary, pos: &Tensor, mask: &Tensor, past: Option<&LayerKv>) -> Result<(Tensor, LayerKv)> {
-        let chunks = row_chunks(x.dim(1)?, x.device());
-        let qkv = each(&chunks, |_, start, len| {
-            self.attn.qkv(&self.ln1.forward(&x.narrow(1, start, len)?)?, rot, &pos.narrow(0, start, len)?)
-        })?;
-        let join = |past: Option<&Tensor>, new: Vec<&Tensor>| match (past, new.as_slice()) {
-            (None, [one]) => Ok((*one).clone()),
-            _ => Tensor::cat(&past.into_iter().chain(new).collect::<Vec<_>>(), 2),
-        };
-        let k = join(past.map(|p| &p.k), qkv.iter().map(|c| &c.1).collect())?;
-        let v = join(past.map(|p| &p.v), qkv.iter().map(|c| &c.2).collect())?;
-        let mut out = each(&chunks, |i, start, len| {
-            let h = self.attn.read(&qkv[i].0, &k, &v, &mask.narrow(0, start, len)?)?;
-            self.mlp_block((x.narrow(1, start, len)? + h)?)
-        })?;
-        let out = if out.len() == 1 { out.remove(0) } else { Tensor::cat(&out, 1)? };
-        Ok((out, LayerKv { k, v }))
-    }
-}
-
-/// Fewest tokens worth a thread of their own.
-const MIN_ROWS: usize = 8;
-
-/// `(start, len)` ranges of `t` new tokens to run side by side: one per CPU
-/// thread while each keeps `MIN_ROWS` tokens, a single one on a GPU.
-fn row_chunks(t: usize, dev: &Device) -> Vec<(usize, usize)> {
-    let n = if dev.is_cpu() { rayon::current_num_threads().min(t / MIN_ROWS).max(1) } else { 1 };
-    (0..n).map(|i| (i * t / n, (i + 1) * t / n - i * t / n)).collect()
-}
-
-/// `f(index, start, len)` for every chunk, in parallel when there are several.
-fn each<T: Send>(chunks: &[(usize, usize)], f: impl Fn(usize, usize, usize) -> Result<T> + Sync) -> Result<Vec<T>> {
-    match *chunks {
-        [(start, len)] => Ok(vec![f(0, start, len)?]),
-        _ => chunks.par_iter().enumerate().map(|(i, &(start, len))| f(i, start, len)).collect(),
     }
 }
 
@@ -396,9 +353,9 @@ impl Qwen3 {
             past += part.len();
             let mut x = self.embed.rows(part, &self.device)?.unsqueeze(0)?;
             for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-                let (h, kv) = layer.forward(&x, &self.rot, &pos, &mask, cache.as_ref())?;
+                let (h, kv) = layer.attn.forward(&layer.ln1.forward(&x)?, &self.rot, &pos, &mask, cache.as_ref())?;
                 *cache = Some(kv);
-                x = h;
+                x = layer.mlp_block((x + h)?)?;
             }
         }
         Ok(PrefixKv { layers: caches.into_iter().map(|c| c.expect("non-empty prefix")).collect(), len: tokens.len() })
@@ -430,14 +387,14 @@ impl Qwen3 {
         let mut kept: Vec<Vec<LayerKv>> = keep.iter().map(|_| Vec::with_capacity(self.layers.len())).collect();
         let mut x = self.embed.rows(tokens, &self.device)?.unsqueeze(0)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            let (h, kv) = layer.forward(&x, &self.rot, &pos, &mask, past.map(|p| &p[i]))?;
+            let (h, kv) = layer.attn.forward(&layer.ln1.forward(&x)?, &self.rot, &pos, &mask, past.map(|p| &p[i]))?;
             for (slot, &(start, len)) in kept.iter_mut().zip(keep) {
                 slot.push(LayerKv {
                     k: kv.k.narrow(2, past_len + start, len)?.contiguous()?,
                     v: kv.v.narrow(2, past_len + start, len)?.contiguous()?,
                 });
             }
-            x = h;
+            x = layer.mlp_block((x + h)?)?;
         }
         let x = x.squeeze(0)?.index_select(&Tensor::new(gather, &self.device)?, 0)?;
         Ok((self.norm.forward(&x)?.to_dtype(DType::F32)?, kept))
