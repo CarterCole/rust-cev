@@ -76,6 +76,16 @@ z'_k = z_k · e^{-τ} + b_k + w_k · x,     x = standardize(h)/√d
 
 At zero, the layer is exactly the base model. After each label, cev refits over a replay buffer of recent labels (SGD warm start). It serves the adapter only once it beats the base model prequentially. That means every label is scored by both the base model and the adapter *before* either learns from it, so the comparison is always on unseen data. `GET /v1/tasks` shows both losses.
 
+#### Namespaces
+
+Set `namespace` on a request (for example a customer, tenant, or experiment arm) to give its feedback its own bucket. Adapters are keyed by namespace *and* task. Labels on a decision made in `"acme"` only train and change answers for `"acme"`. Requests without a namespace use the default bucket, which never sees namespaced labels. Every namespace starts from the base model, and its adapter is only served once it wins on that namespace's own labels.
+
+```json
+{"state": "…", "namespace": "acme", "questions": {"team": {"type": "choice", "task": "router", "…": "…"}}}
+```
+
+Feedback needs no namespace: it applies to the decision's own. The answer's `x_cev.namespace` and the feedback response echo it back.
+
 Measured with a 3-level severity scale (`scripts/demo_online.py`):
 
 - **Raw Qwen3-0.6B** (`--debias none`). 21 labels raised held-out accuracy from 0.33 to 0.89. The adapter learned T = 2.47, so the raw model was overconfident.
@@ -167,15 +177,15 @@ int8 halves the download and memory but is not faster: 70–85% of the time is t
 
 | Method | Path | |
 |---|---|---|
-| POST | `/v1/systemone` | Jev-compatible decide. Extensions: `task` per question, `no_store`, `debias`; `request_id`, `latency_ms`, and `x_cev.decision_id` in the response |
+| POST | `/v1/systemone` | Jev-compatible decide. Extensions: `task` per question, `namespace`, `no_store`, `debias`; `request_id`, `latency_ms`, and `x_cev.decision_id` in the response |
 | GET | `/v1/models` | Backbone, code vocabulary size, prompt version |
 | POST | `/v1/feedback` | `{decision_id \| request_id+question_id, label?, weight?, comment?, metadata?}` |
-| POST | `/v1/examples` | `{examples: [{state, questions, labels}]}`: decide, then learn from the labels |
-| GET | `/v1/decisions?task=&limit=&offset=` | Recent decisions |
+| POST | `/v1/examples` | `{examples: [{state, questions, labels, namespace?}]}`: decide, then learn from the labels |
+| GET | `/v1/decisions?task=&namespace=&limit=&offset=` | Recent decisions |
 | GET | `/v1/decisions/{id}` | One decision with its state, exact prompt, and all feedback |
-| GET | `/v1/tasks`, `/v1/tasks/{task}` | Adapter status: labels, temperature, prequential losses, active |
-| DELETE | `/v1/tasks/{task}` | Drop an adapter; its labels stay in the log |
-| GET | `/v1/export?task=&labeled=&since=&limit=` | NDJSON training rows |
+| GET | `/v1/tasks?namespace=`, `/v1/tasks/{task}?namespace=` | Adapter status: labels, temperature, prequential losses, active |
+| DELETE | `/v1/tasks/{task}?namespace=` | Drop an adapter; its labels stay in the log |
+| GET | `/v1/export?task=&namespace=&labeled=&since=&limit=` | NDJSON training rows |
 | GET | `/v1/stats`, `/health` | Counts and liveness |
 
 Labels:
@@ -230,6 +240,7 @@ enum Team {
 }
 
 let cev = cev::Cev::http("http://127.0.0.1:8080");      // or Cev::local(runtime) in-process
+let acme = cev.clone().with_namespace("acme");            // feedback on acme's decisions only adapts acme
 
 if *cev.check(&ticket, "Is the customer asking for a refund?").await? { /* … */ }
 

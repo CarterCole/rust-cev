@@ -77,13 +77,14 @@ async fn examples(State(s): State<AppState>, Json(req): Json<ExamplesRequest>) -
 #[derive(Deserialize)]
 struct Page {
     task: Option<String>,
+    namespace: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 }
 
 async fn decisions(State(s): State<AppState>, Query(p): Query<Page>) -> ApiResult<Value> {
     let rows = s
-        .blocking(move |c| Ok(c.store().recent_decisions(p.task.as_deref(), p.limit.unwrap_or(50).min(1000), p.offset.unwrap_or(0))?))
+        .blocking(move |c| Ok(c.store().recent_decisions(p.task.as_deref(), p.namespace.as_deref(), p.limit.unwrap_or(50).min(1000), p.offset.unwrap_or(0))?))
         .await?;
     Ok(Json(json!({"data": rows})))
 }
@@ -106,16 +107,25 @@ async fn decision(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
     })))
 }
 
-async fn tasks(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({"data": s.cev.tasks()}))
+/// `?namespace=` picks a feedback bucket; omitted means the default one
+/// (or, for the task list, every namespace).
+#[derive(Deserialize)]
+struct Ns {
+    namespace: Option<String>,
 }
 
-async fn task(State(s): State<AppState>, Path(task): Path<String>) -> ApiResult<cev_runtime::TaskInfo> {
-    Ok(Json(s.cev.task(&task).ok_or_else(|| CevError::NotFound(format!("no adapter for task `{task}`")))?))
+async fn tasks(State(s): State<AppState>, Query(q): Query<Ns>) -> Json<Value> {
+    Json(json!({"data": s.cev.tasks(q.namespace.as_deref())}))
 }
 
-async fn reset_task(State(s): State<AppState>, Path(task): Path<String>) -> ApiResult<Value> {
-    let deleted = s.blocking(move |c| c.reset_task(&task)).await?;
+async fn task(State(s): State<AppState>, Path(task): Path<String>, Query(q): Query<Ns>) -> ApiResult<cev_runtime::TaskInfo> {
+    let ns = q.namespace.unwrap_or_default();
+    Ok(Json(s.cev.task(&ns, &task).ok_or_else(|| CevError::NotFound(format!("no adapter for task `{task}`")))?))
+}
+
+async fn reset_task(State(s): State<AppState>, Path(task): Path<String>, Query(q): Query<Ns>) -> ApiResult<Value> {
+    let ns = q.namespace.unwrap_or_default();
+    let deleted = s.blocking(move |c| c.reset_task(&ns, &task)).await?;
     Ok(Json(json!({"deleted": deleted})))
 }
 
@@ -137,5 +147,5 @@ async fn export(State(s): State<AppState>, Query(f): Query<ExportFilter>) -> Res
 
 async fn stats(State(s): State<AppState>) -> ApiResult<Value> {
     let st = s.blocking(|c| c.stats()).await?;
-    Ok(Json(json!({"store": st, "tasks": s.cev.tasks().len(), "model": s.cev.model_info()})))
+    Ok(Json(json!({"store": st, "tasks": s.cev.tasks(None).len(), "model": s.cev.model_info()})))
 }

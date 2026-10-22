@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     adapted      INTEGER NOT NULL,
     hidden       BLOB,
     created_at   INTEGER NOT NULL,
+    namespace    TEXT NOT NULL DEFAULT '',
     UNIQUE (request_id, question_id)
 );
 CREATE INDEX IF NOT EXISTS decisions_task ON decisions(model, task, created_at);
@@ -54,15 +55,38 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS feedback_decision ON feedback(decision_id, created_at);
 CREATE TABLE IF NOT EXISTS adapters (
     model      TEXT NOT NULL,
+    namespace  TEXT NOT NULL DEFAULT '',
     task       TEXT NOT NULL,
     data       TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
-    PRIMARY KEY (model, task)
+    PRIMARY KEY (model, namespace, task)
 );
 CREATE TABLE IF NOT EXISTS normalizers (
     model TEXT PRIMARY KEY,
     data  TEXT NOT NULL
 );
+"#;
+
+/// Databases from before namespaces: add the column to decisions, and rebuild
+/// adapters so the namespace is part of its key. Existing rows land in the
+/// default namespace.
+const MIGRATE_NAMESPACES: &str = r#"
+ALTER TABLE decisions ADD COLUMN namespace TEXT NOT NULL DEFAULT '';
+CREATE TABLE adapters_ns (
+    model      TEXT NOT NULL,
+    namespace  TEXT NOT NULL DEFAULT '',
+    task       TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (model, namespace, task)
+);
+INSERT INTO adapters_ns (model, task, data, updated_at) SELECT model, task, data, updated_at FROM adapters;
+DROP TABLE adapters;
+ALTER TABLE adapters_ns RENAME TO adapters;
+"#;
+
+const INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS decisions_namespace ON decisions(model, namespace, task, created_at);
 "#;
 
 fn f32_blob(v: &[f32]) -> Vec<u8> {
@@ -88,6 +112,15 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        let has_namespace: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'namespace'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_namespace {
+            conn.execute_batch(&format!("BEGIN; {MIGRATE_NAMESPACES} COMMIT;"))?;
+        }
+        conn.execute_batch(INDEXES)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -95,13 +128,15 @@ impl Store {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         tx.execute(
-            "INSERT INTO requests VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO requests (request_id, model, state, prefix, input_tokens, latency_ms, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![r.request_id, r.model, r.state.to_string(), r.prefix, r.input_tokens as i64, r.latency_ms, r.created_at],
         )?;
         {
-            let mut st = tx.prepare(
-                "INSERT INTO decisions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            )?;
+            let sql = format!(
+                "INSERT INTO decisions ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                Self::DECISION_COLS
+            );
+            let mut st = tx.prepare(&sql)?;
             for d in decisions {
                 st.execute(params![
                     d.decision_id,
@@ -119,6 +154,7 @@ impl Store {
                     d.adapted,
                     d.hidden.as_deref().map(f32_blob),
                     d.created_at,
+                    d.namespace,
                 ])?;
             }
         }
@@ -126,7 +162,7 @@ impl Store {
         Ok(())
     }
 
-    const DECISION_COLS: &'static str = "decision_id, request_id, question_id, model, task, kind, question, options, codes, suffix, base_logits, served, adapted, hidden, created_at";
+    const DECISION_COLS: &'static str = "decision_id, request_id, question_id, model, task, kind, question, options, codes, suffix, base_logits, served, adapted, hidden, created_at, namespace";
 
     fn row_decision(row: &rusqlite::Row) -> rusqlite::Result<DecisionRecord> {
         fn de<T: serde::de::DeserializeOwned>(s: String) -> rusqlite::Result<T> {
@@ -148,6 +184,7 @@ impl Store {
             adapted: row.get(12)?,
             hidden: row.get::<_, Option<Vec<u8>>>(13)?.map(|b| blob_f32(&b)),
             created_at: row.get(14)?,
+            namespace: row.get(15)?,
         })
     }
 
@@ -192,23 +229,24 @@ impl Store {
         Ok(rows)
     }
 
-    /// Most recent decisions, optionally for one task.
-    pub fn recent_decisions(&self, task: Option<&str>, limit: usize, offset: usize) -> Result<Vec<DecisionRecord>> {
+    /// Most recent decisions, optionally for one task and/or namespace.
+    pub fn recent_decisions(&self, task: Option<&str>, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<DecisionRecord>> {
         let c = self.conn.lock();
         let sql = format!(
-            "SELECT {} FROM decisions WHERE (?1 IS NULL OR task = ?1) ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
+            "SELECT {} FROM decisions WHERE (?1 IS NULL OR task = ?1) AND (?4 IS NULL OR namespace = ?4)
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
             Self::DECISION_COLS
         );
         let mut st = c.prepare(&sql)?;
         let rows = st
-            .query_map(params![task, limit as i64, offset as i64], Self::row_decision)?
+            .query_map(params![task, limit as i64, offset as i64, namespace.map(str::trim)], Self::row_decision)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
     pub fn insert_feedback(&self, f: &FeedbackRecord) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT INTO feedback VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO feedback (feedback_id, decision_id, label, target, weight, comment, metadata, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 f.feedback_id,
                 f.decision_id,
@@ -247,19 +285,20 @@ impl Store {
         Ok(rows)
     }
 
-    /// Latest label per decision for a task, oldest first, as replay samples.
-    pub fn replay(&self, model: &str, task: &str, limit: usize) -> Result<Vec<Sample>> {
+    /// Latest label per decision for a task in a namespace, oldest first, as
+    /// replay samples.
+    pub fn replay(&self, model: &str, namespace: &str, task: &str, limit: usize) -> Result<Vec<Sample>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
             "SELECT d.decision_id, d.options, d.base_logits, d.hidden, f.target, f.weight FROM feedback f
              JOIN decisions d ON d.decision_id = f.decision_id
-             WHERE d.model = ?1 AND d.task = ?2 AND f.target IS NOT NULL AND d.hidden IS NOT NULL
+             WHERE d.model = ?1 AND d.task = ?2 AND d.namespace = ?4 AND f.target IS NOT NULL AND d.hidden IS NOT NULL
                AND f.rowid = (SELECT f2.rowid FROM feedback f2 WHERE f2.decision_id = f.decision_id
                               AND f2.target IS NOT NULL ORDER BY f2.created_at DESC, f2.rowid DESC LIMIT 1)
              ORDER BY f.created_at DESC, f.rowid DESC LIMIT ?3",
         )?;
         let mut rows: Vec<Sample> = st
-            .query_map(params![model, task, limit as i64], |r| {
+            .query_map(params![model, task, limit as i64, namespace], |r| {
                 let options: Vec<OptionSpec> = serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default();
                 Ok(Sample {
                     decision_id: r.get(0)?,
@@ -275,29 +314,34 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn save_adapter(&self, model: &str, task: &str, a: &Adapter) -> Result<()> {
+    pub fn save_adapter(&self, model: &str, namespace: &str, task: &str, a: &Adapter) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT INTO adapters VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(model, task) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-            params![model, task, serde_json::to_string(a)?, now_ms()],
+            "INSERT INTO adapters (model, namespace, task, data, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(model, namespace, task) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![model, namespace, task, serde_json::to_string(a)?, now_ms()],
         )?;
         Ok(())
     }
 
-    pub fn load_adapters(&self, model: &str) -> Result<Vec<(String, Adapter)>> {
+    /// Every adapter of a model as (namespace, task, adapter).
+    pub fn load_adapters(&self, model: &str) -> Result<Vec<(String, String, Adapter)>> {
         let c = self.conn.lock();
-        let mut st = c.prepare("SELECT task, data FROM adapters WHERE model = ?1")?;
+        let mut st = c.prepare("SELECT namespace, task, data FROM adapters WHERE model = ?1")?;
         let rows = st
-            .query_map([model], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([model], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
-            .filter_map(|(t, d)| serde_json::from_str(&d).ok().map(|a| (t, a)))
+            .filter_map(|(ns, t, d)| serde_json::from_str(&d).ok().map(|a| (ns, t, a)))
             .collect())
     }
 
-    pub fn delete_adapter(&self, model: &str, task: &str) -> Result<bool> {
-        Ok(self.conn.lock().execute("DELETE FROM adapters WHERE model = ?1 AND task = ?2", [model, task])? > 0)
+    pub fn delete_adapter(&self, model: &str, namespace: &str, task: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .execute("DELETE FROM adapters WHERE model = ?1 AND namespace = ?2 AND task = ?3", [model, namespace, task])?
+            > 0)
     }
 
     pub fn save_normalizer(&self, model: &str, n: &Normalizer) -> Result<()> {
@@ -326,7 +370,7 @@ impl Store {
              FROM decisions d JOIN requests r ON r.request_id = d.request_id
              {join} JOIN feedback fb ON fb.rowid = (SELECT f2.rowid FROM feedback f2 WHERE f2.decision_id = d.decision_id
                  ORDER BY (f2.target IS NOT NULL) DESC, f2.created_at DESC, f2.rowid DESC LIMIT 1)
-             WHERE (?1 IS NULL OR d.task = ?1) AND (?2 IS NULL OR d.model = ?2)
+             WHERE (?1 IS NULL OR d.task = ?1) AND (?2 IS NULL OR d.model = ?2) AND (?5 IS NULL OR d.namespace = ?5)
                AND (?3 IS NULL OR COALESCE(fb.created_at, d.created_at) >= ?3)
                {label_filter}
              ORDER BY d.created_at, d.rowid LIMIT ?4",
@@ -336,22 +380,22 @@ impl Store {
         );
         let mut st = c.prepare(&sql)?;
         let limit = f.limit.map(|l| l as i64).unwrap_or(-1);
-        let mut rows = st.query(params![f.task, f.model, f.since, limit])?;
+        let mut rows = st.query(params![f.task, f.model, f.since, limit, f.namespace.as_deref().map(str::trim)])?;
         let mut n = 0;
         while let Some(r) = rows.next()? {
             let d = Self::row_decision(r)?;
-            let prefix: String = r.get(15)?;
+            let prefix: String = r.get(16)?;
             let js = |i: usize| -> rusqlite::Result<Option<String>> { r.get(i) };
             let row = ExportRow {
                 prompt: format!("{prefix}{}", d.suffix),
-                state: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or(Value::Null),
-                feedback_id: r.get(17)?,
-                label: js(18)?.and_then(|s| serde_json::from_str(&s).ok()),
-                target: js(19)?.and_then(|s| serde_json::from_str(&s).ok()),
-                weight: r.get::<_, Option<f64>>(20)?.unwrap_or(1.0),
-                comment: r.get(21)?,
-                metadata: js(22)?.and_then(|s| serde_json::from_str(&s).ok()),
-                labeled_at: r.get(23)?,
+                state: serde_json::from_str(&r.get::<_, String>(17)?).unwrap_or(Value::Null),
+                feedback_id: r.get(18)?,
+                label: js(19)?.and_then(|s| serde_json::from_str(&s).ok()),
+                target: js(20)?.and_then(|s| serde_json::from_str(&s).ok()),
+                weight: r.get::<_, Option<f64>>(21)?.unwrap_or(1.0),
+                comment: r.get(22)?,
+                metadata: js(23)?.and_then(|s| serde_json::from_str(&s).ok()),
+                labeled_at: r.get(24)?,
                 base_probabilities: cev_core::math::softmax(&d.base_logits),
                 options: d.options.iter().map(|o| o.name.clone()).collect(),
                 decision_id: d.decision_id,
@@ -359,6 +403,7 @@ impl Store {
                 question_id: d.question_id,
                 model: d.model,
                 task: d.task,
+                namespace: d.namespace,
                 kind: d.kind,
                 codes: d.codes,
                 served: d.served,

@@ -47,6 +47,9 @@ pub struct DecisionRecord {
     pub question_id: String,
     pub model: String,
     pub task: String,
+    /// Feedback bucket the decision was made in; empty for the default one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
     pub kind: QuestionType,
     pub question: Question,
     pub options: Vec<OptionSpec>,
@@ -82,6 +85,8 @@ pub struct ExportRow {
     pub question_id: String,
     pub model: String,
     pub task: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
     #[serde(rename = "type")]
     pub kind: QuestionType,
     /// Full prompt text; the answer is the next token.
@@ -108,6 +113,8 @@ pub struct ExportRow {
 pub struct ExportFilter {
     /// Only this task.
     pub task: Option<String>,
+    /// Only this namespace (`""` for the default one).
+    pub namespace: Option<String>,
     /// Only decisions made by this model id.
     pub model: Option<String>,
     /// `true` (default): only decisions with a label; `false`: every decision

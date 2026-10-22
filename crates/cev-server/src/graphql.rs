@@ -87,6 +87,7 @@ pub struct DecisionAnswer {
     pub kind: Kind,
     pub decision_id: String,
     pub task: String,
+    pub namespace: Option<String>,
     pub adapted: bool,
     /// choice: the chosen option; noul: "true"/"false"; score: nearest level.
     pub answer: String,
@@ -110,6 +111,7 @@ pub struct FeedbackResult {
     pub feedback_id: String,
     pub decision_id: String,
     pub task: String,
+    pub namespace: Option<String>,
     pub served_loss: Option<f64>,
     pub learned: bool,
     pub task_examples: u64,
@@ -119,6 +121,8 @@ pub struct FeedbackResult {
 #[derive(SimpleObject)]
 pub struct Task {
     pub task: String,
+    /// Feedback bucket; empty for the default one.
+    pub namespace: String,
     pub examples: u64,
     pub buffered: u64,
     pub active: bool,
@@ -131,6 +135,7 @@ impl From<cev_runtime::TaskInfo> for Task {
     fn from(t: cev_runtime::TaskInfo) -> Self {
         Self {
             task: t.task,
+            namespace: t.namespace,
             examples: t.examples,
             buffered: t.buffered as u64,
             active: t.active,
@@ -148,6 +153,7 @@ pub struct StoredDecision {
     pub question_id: String,
     pub model: String,
     pub task: String,
+    pub namespace: String,
     #[graphql(name = "type")]
     pub kind: Kind,
     pub question: Json<Value>,
@@ -207,12 +213,13 @@ fn to_answer(qid: &str, a: Answer) -> DecisionAnswer {
             x_cev,
         ),
     };
-    let meta = meta.unwrap_or(cev_core::AnswerMeta { decision_id: String::new(), task: String::new(), adapted: false, base_probabilities: None });
+    let meta = meta.unwrap_or(cev_core::AnswerMeta { decision_id: String::new(), task: String::new(), namespace: None, adapted: false, base_probabilities: None });
     DecisionAnswer {
         question_id: qid.to_string(),
         kind,
         decision_id: meta.decision_id,
         task: meta.task,
+        namespace: meta.namespace,
         adapted: meta.adapted,
         answer,
         noul,
@@ -240,12 +247,13 @@ impl QueryRoot {
         Ok(Stats { requests: s.requests, decisions: s.decisions, feedback: s.feedback, labeled_decisions: s.labeled_decisions })
     }
 
-    async fn tasks(&self, ctx: &Context<'_>) -> Vec<Task> {
-        state(ctx).cev.tasks().into_iter().map(Task::from).collect()
+    /// Adapters of one namespace (`""` is the default), or of all of them.
+    async fn tasks(&self, ctx: &Context<'_>, namespace: Option<String>) -> Vec<Task> {
+        state(ctx).cev.tasks(namespace.as_deref()).into_iter().map(Task::from).collect()
     }
 
-    async fn task(&self, ctx: &Context<'_>, name: String) -> Option<Task> {
-        state(ctx).cev.task(&name).map(Task::from)
+    async fn task(&self, ctx: &Context<'_>, name: String, namespace: Option<String>) -> Option<Task> {
+        state(ctx).cev.task(namespace.as_deref().unwrap_or_default(), &name).map(Task::from)
     }
 
     async fn decision(&self, ctx: &Context<'_>, id: String) -> Result<Option<StoredDecision>> {
@@ -259,10 +267,16 @@ impl QueryRoot {
         .map_err(gql_err)
     }
 
-    async fn decisions(&self, ctx: &Context<'_>, task: Option<String>, #[graphql(default = 50)] limit: usize, #[graphql(default = 0)] offset: usize) -> Result<Vec<StoredDecision>> {
+    async fn decisions(
+        &self,
+        ctx: &Context<'_>,
+        task: Option<String>,
+        namespace: Option<String>,
+        #[graphql(default = 50)] limit: usize, #[graphql(default = 0)] offset: usize,
+    ) -> Result<Vec<StoredDecision>> {
         state(ctx)
             .blocking(move |c| {
-                let rows = c.store().recent_decisions(task.as_deref(), limit.min(1000), offset)?;
+                let rows = c.store().recent_decisions(task.as_deref(), namespace.as_deref(), limit.min(1000), offset)?;
                 rows.into_iter()
                     .map(|d| {
                         let fb = c.store().feedback_for(&d.decision_id)?;
@@ -287,6 +301,7 @@ fn stored(d: cev_runtime::store::DecisionRecord, fb: Vec<cev_runtime::store::Fee
         question_id: d.question_id,
         model: d.model,
         task: d.task,
+        namespace: d.namespace,
         kind: d.kind.into(),
         served: d.served,
         adapted: d.adapted,
@@ -306,6 +321,7 @@ impl MutationRoot {
         questions: Vec<QuestionInput>,
         #[graphql(default = false)] no_store: bool,
         debias: Option<DebiasMode>,
+        #[graphql(desc = "Feedback bucket: labels on these decisions only adapt answers in it.")] namespace: Option<String>,
     ) -> Result<DecideResult> {
         let mut qs = IndexMap::new();
         for q in questions {
@@ -315,7 +331,7 @@ impl MutationRoot {
             }
         }
         let resp = state(ctx)
-            .decide(SystemOneRequest { state: state_.0, model: None, questions: qs, no_store, debias: debias.map(Into::into) })
+            .decide(SystemOneRequest { state: state_.0, model: None, questions: qs, no_store, debias: debias.map(Into::into), namespace })
             .await
             .map_err(gql_err)?;
         Ok(DecideResult {
@@ -348,6 +364,7 @@ impl MutationRoot {
             feedback_id: r.feedback_id,
             decision_id: r.decision_id,
             task: r.task,
+            namespace: r.namespace,
             served_loss: r.served_loss,
             learned: r.learned,
             task_examples: r.task_examples,
@@ -355,8 +372,9 @@ impl MutationRoot {
         })
     }
 
-    /// Forget a task's online adapter (labels are kept).
-    async fn reset_task(&self, ctx: &Context<'_>, name: String) -> Result<bool> {
-        state(ctx).blocking(move |c| c.reset_task(&name)).await.map_err(gql_err)
+    /// Forget a task's online adapter in a namespace (labels are kept).
+    async fn reset_task(&self, ctx: &Context<'_>, name: String, namespace: Option<String>) -> Result<bool> {
+        let ns = namespace.unwrap_or_default();
+        state(ctx).blocking(move |c| c.reset_task(&ns, &name)).await.map_err(gql_err)
     }
 }

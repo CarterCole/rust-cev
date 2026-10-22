@@ -19,6 +19,11 @@ pub struct SystemOneRequest {
     /// Position-bias correction; defaults to the server setting (cev extension).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debias: Option<crate::compile::Debias>,
+    /// Feedback bucket (cev extension). Online adapters are kept per
+    /// namespace and task, so labels on decisions made in one namespace only
+    /// change answers served in that namespace. Omit for the default bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -101,6 +106,8 @@ pub struct AnswerMeta {
     /// Id of this single decision; send it back with `/v1/feedback`.
     pub decision_id: String,
     pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// True when an online adapter adjusted this answer.
     pub adapted: bool,
     /// Distribution before the adapter, over the same keys as `probabilities`.
@@ -153,6 +160,8 @@ pub struct FeedbackResponse {
     pub feedback_id: String,
     pub decision_id: String,
     pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Log loss of the answer that was served, on this label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_loss: Option<f64>,
@@ -173,6 +182,8 @@ pub struct Example {
     pub state: Value,
     pub questions: IndexMap<String, Question>,
     pub labels: IndexMap<String, Label>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -14,7 +14,8 @@ struct Inner {
     decisions: Vec<DecisionRecord>,
     by_id: HashMap<String, usize>,
     feedback: Vec<FeedbackRecord>,
-    adapters: HashMap<(String, String), String>,
+    /// By (model, namespace, task).
+    adapters: HashMap<(String, String, String), String>,
     normalizers: HashMap<String, String>,
 }
 
@@ -74,11 +75,15 @@ impl Store {
         Ok(self.inner.lock().decisions.iter().filter(|d| d.request_id == request_id).cloned().collect())
     }
 
-    /// Most recent decisions, optionally for one task.
-    pub fn recent_decisions(&self, task: Option<&str>, limit: usize, offset: usize) -> Result<Vec<DecisionRecord>> {
+    /// Most recent decisions, optionally for one task and/or namespace.
+    pub fn recent_decisions(&self, task: Option<&str>, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<DecisionRecord>> {
         let s = self.inner.lock();
-        let mut rows: Vec<(usize, &DecisionRecord)> =
-            s.decisions.iter().enumerate().filter(|(_, d)| task.is_none_or(|t| d.task == t)).collect();
+        let mut rows: Vec<(usize, &DecisionRecord)> = s
+            .decisions
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| task.is_none_or(|t| d.task == t) && namespace.is_none_or(|n| d.namespace == n.trim()))
+            .collect();
         rows.sort_by_key(|(i, d)| std::cmp::Reverse((d.created_at, *i)));
         Ok(rows.into_iter().skip(offset).take(limit).map(|(_, d)| d.clone()).collect())
     }
@@ -99,13 +104,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Latest label per decision for a task, oldest first, as replay samples.
-    pub fn replay(&self, model: &str, task: &str, limit: usize) -> Result<Vec<Sample>> {
+    /// Latest label per decision for a task in a namespace, oldest first, as
+    /// replay samples.
+    pub fn replay(&self, model: &str, namespace: &str, task: &str, limit: usize) -> Result<Vec<Sample>> {
         let s = self.inner.lock();
         let mut rows: Vec<(i64, Sample)> = s
             .decisions
             .iter()
-            .filter(|d| d.model == model && d.task == task)
+            .filter(|d| d.model == model && d.namespace == namespace && d.task == task)
             .filter_map(|d| {
                 let f = s.latest_feedback(&d.decision_id, true)?;
                 Some((f.created_at, Sample {
@@ -123,22 +129,23 @@ impl Store {
         Ok(rows.into_iter().skip(skip).map(|(_, s)| s).collect())
     }
 
-    pub fn save_adapter(&self, model: &str, task: &str, a: &Adapter) -> Result<()> {
-        self.inner.lock().adapters.insert((model.into(), task.into()), serde_json::to_string(a)?);
+    pub fn save_adapter(&self, model: &str, namespace: &str, task: &str, a: &Adapter) -> Result<()> {
+        self.inner.lock().adapters.insert((model.into(), namespace.into(), task.into()), serde_json::to_string(a)?);
         Ok(())
     }
 
-    pub fn load_adapters(&self, model: &str) -> Result<Vec<(String, Adapter)>> {
+    /// Every adapter of a model as (namespace, task, adapter).
+    pub fn load_adapters(&self, model: &str) -> Result<Vec<(String, String, Adapter)>> {
         let s = self.inner.lock();
         Ok(s.adapters
             .iter()
-            .filter(|((m, _), _)| m == model)
-            .filter_map(|((_, t), d)| serde_json::from_str(d).ok().map(|a| (t.clone(), a)))
+            .filter(|((m, _, _), _)| m == model)
+            .filter_map(|((_, ns, t), d)| serde_json::from_str(d).ok().map(|a| (ns.clone(), t.clone(), a)))
             .collect())
     }
 
-    pub fn delete_adapter(&self, model: &str, task: &str) -> Result<bool> {
-        Ok(self.inner.lock().adapters.remove(&(model.to_string(), task.to_string())).is_some())
+    pub fn delete_adapter(&self, model: &str, namespace: &str, task: &str) -> Result<bool> {
+        Ok(self.inner.lock().adapters.remove(&(model.to_string(), namespace.to_string(), task.to_string())).is_some())
     }
 
     pub fn save_normalizer(&self, model: &str, n: &Normalizer) -> Result<()> {
@@ -164,7 +171,10 @@ impl Store {
             if labeled && fb.is_none_or(|fb| fb.target.is_none()) {
                 continue;
             }
-            if f.task.as_ref().is_some_and(|t| *t != d.task) || f.model.as_ref().is_some_and(|m| *m != d.model) {
+            if f.task.as_ref().is_some_and(|t| *t != d.task)
+                || f.model.as_ref().is_some_and(|m| *m != d.model)
+                || f.namespace.as_ref().is_some_and(|n| n.trim() != d.namespace)
+            {
                 continue;
             }
             if f.since.is_some_and(|t| fb.map_or(d.created_at, |fb| fb.created_at) < t) {
@@ -177,6 +187,7 @@ impl Store {
                 question_id: d.question_id.clone(),
                 model: d.model.clone(),
                 task: d.task.clone(),
+                namespace: d.namespace.clone(),
                 kind: d.kind,
                 prompt: format!("{}{}", r.prefix, d.suffix),
                 codes: d.codes.clone(),

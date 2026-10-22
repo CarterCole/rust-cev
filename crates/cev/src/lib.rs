@@ -132,6 +132,7 @@ pub struct Cev {
     transport: Arc<Transport>,
     no_store: bool,
     debias: Option<Debias>,
+    namespace: Option<String>,
 }
 
 impl Cev {
@@ -139,7 +140,7 @@ impl Cev {
     #[cfg(feature = "http")]
     pub fn http(base_url: impl Into<String>) -> Self {
         let base = base_url.into().trim_end_matches('/').to_string();
-        Self { transport: Arc::new(Transport::Http { base, key: None, client: reqwest::Client::new() }), no_store: false, debias: None }
+        Self { transport: Arc::new(Transport::Http { base, key: None, client: reqwest::Client::new() }), no_store: false, debias: None, namespace: None }
     }
 
     #[cfg(feature = "http")]
@@ -149,6 +150,7 @@ impl Cev {
                 transport: Arc::new(Transport::Http { base: base.clone(), key: Some(key.into()), client: client.clone() }),
                 no_store: self.no_store,
                 debias: self.debias,
+                namespace: self.namespace,
             },
             #[allow(unreachable_patterns)]
             _ => self,
@@ -163,7 +165,7 @@ impl Cev {
 
     #[cfg(feature = "local")]
     pub fn from_runtime(runtime: Arc<cev_runtime::Cev>) -> Self {
-        Self { transport: Arc::new(Transport::Local(runtime)), no_store: false, debias: None }
+        Self { transport: Arc::new(Transport::Local(runtime)), no_store: false, debias: None, namespace: None }
     }
 
     /// Don't log decisions made through this handle (they can't take feedback).
@@ -175,6 +177,13 @@ impl Cev {
     /// Override the server's position-bias correction for this handle.
     pub fn with_debias(mut self, debias: Debias) -> Self {
         self.debias = Some(debias);
+        self
+    }
+
+    /// Make decisions in a feedback bucket: labels on them only adapt answers
+    /// served through handles with the same namespace.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
         self
     }
 
@@ -325,7 +334,14 @@ impl Ask {
     }
 
     pub async fn send(self) -> Result<Answers> {
-        let req = SystemOneRequest { state: self.state, model: None, questions: self.questions, no_store: self.cev.no_store, debias: self.cev.debias };
+        let req = SystemOneRequest {
+            state: self.state,
+            model: None,
+            questions: self.questions,
+            no_store: self.cev.no_store,
+            debias: self.cev.debias,
+            namespace: self.cev.namespace.clone(),
+        };
         let resp = self.cev.system_one(req).await?;
         Ok(Answers { cev: self.cev, resp })
     }

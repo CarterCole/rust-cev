@@ -87,14 +87,14 @@ impl Cev {
         json(&self.0.feedback(&req).map_err(err)?)
     }
 
-    /// `GET /v1/tasks`
-    pub fn tasks(&self) -> Result<String, JsError> {
-        json(&self.0.tasks())
+    /// `GET /v1/tasks?namespace=`
+    pub fn tasks(&self, namespace: Option<String>) -> Result<String, JsError> {
+        json(&self.0.tasks(namespace.as_deref()))
     }
 
-    /// `DELETE /v1/tasks/{task}`
-    pub fn reset_task(&self, task: &str) -> Result<bool, JsError> {
-        self.0.reset_task(task).map_err(err)
+    /// `DELETE /v1/tasks/{task}?namespace=`
+    pub fn reset_task(&self, task: &str, namespace: Option<String>) -> Result<bool, JsError> {
+        self.0.reset_task(namespace.as_deref().unwrap_or_default(), task).map_err(err)
     }
 
     /// `GET /v1/export`: NDJSON training rows.

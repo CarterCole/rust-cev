@@ -79,7 +79,7 @@ fn adapter_takes_over_after_consistent_corrections_and_persists() {
             let r = cev.decide(&request(texts[i % texts.len()])).unwrap();
             cev.feedback(&label(&decision_id(&r.answers["team"]), Label::Text("tech".into()))).unwrap();
         }
-        let t = cev.task("router").unwrap();
+        let t = cev.task("", "router").unwrap();
         assert!(t.active, "{t:?}");
         let r = cev.decide(&request("invoices broken")).unwrap();
         let Answer::Choice { choice, x_cev, .. } = &r.answers["team"] else { panic!() };
@@ -88,12 +88,82 @@ fn adapter_takes_over_after_consistent_corrections_and_persists() {
     }
     // Restart: adapter and replay buffer come back from the store.
     let cev = Cev::new(backend, Store::open(&db).unwrap(), RuntimeConfig::default()).unwrap();
-    let t = cev.task("router").unwrap();
+    let t = cev.task("", "router").unwrap();
     assert!(t.active && t.buffered == 30, "{t:?}");
     let r = cev.decide(&request("invoices late")).unwrap();
     let Answer::Choice { choice, .. } = &r.answers["team"] else { panic!() };
     assert_eq!(choice, "tech");
-    assert!(cev.reset_task("router").unwrap());
+    assert!(cev.reset_task("", "router").unwrap());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn in_namespace(text: &str, ns: &str) -> SystemOneRequest {
+    SystemOneRequest { namespace: Some(ns.into()), ..request(text) }
+}
+
+#[test]
+fn feedback_only_adapts_its_own_namespace() {
+    let cev = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    for i in 0..30 {
+        let r = cev.decide(&in_namespace(&format!("invoices broken {i}"), "acme")).unwrap();
+        let fb = cev.feedback(&label(&decision_id(&r.answers["team"]), Label::Text("tech".into()))).unwrap();
+        assert_eq!(fb.namespace.as_deref(), Some("acme"));
+    }
+    assert!(cev.task("acme", "router").unwrap().active);
+    assert!(cev.task("", "router").is_none() && cev.task("globex", "router").is_none());
+    assert_eq!(cev.tasks(None).len(), 1);
+    assert!(cev.tasks(Some("")).is_empty());
+
+    let served = |ns: Option<&str>| {
+        let req = SystemOneRequest { namespace: ns.map(String::from), ..request("invoices broken") };
+        let r = cev.decide(&req).unwrap();
+        let Answer::Choice { choice, x_cev, .. } = &r.answers["team"] else { panic!() };
+        let meta = x_cev.clone().unwrap();
+        (choice.clone(), meta.adapted, meta.namespace)
+    };
+    assert_eq!(served(Some("acme")), ("tech".into(), true, Some("acme".into())));
+    assert_eq!(served(Some("globex")), ("billing".into(), false, Some("globex".into())));
+    assert_eq!(served(None), ("billing".into(), false, None));
+
+    let mut rows = 0;
+    cev.export(&ExportFilter { namespace: Some("acme".into()), ..Default::default() }, |row| {
+        assert_eq!(row.namespace, "acme");
+        rows += 1;
+        Ok(())
+    }).unwrap();
+    assert_eq!(rows, 30);
+    assert!(!cev.reset_task("", "router").unwrap());
+    assert!(cev.reset_task("acme", "router").unwrap());
+}
+
+#[test]
+fn databases_from_before_namespaces_are_migrated() {
+    let dir = std::env::temp_dir().join(format!("cev-migrate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("cev.db");
+    let _ = std::fs::remove_file(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, question_id TEXT NOT NULL,
+                 model TEXT NOT NULL, task TEXT NOT NULL, kind TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL,
+                 codes TEXT NOT NULL, suffix TEXT NOT NULL, base_logits BLOB NOT NULL, served TEXT NOT NULL,
+                 adapted INTEGER NOT NULL, hidden BLOB, created_at INTEGER NOT NULL, UNIQUE (request_id, question_id));
+             CREATE TABLE adapters (model TEXT NOT NULL, task TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (model, task));
+             INSERT INTO adapters VALUES ('m', 'router', '{}', 1);",
+        )
+        .unwrap();
+    }
+    let backend = Arc::new(MockBackend::default());
+    let cev = Cev::new(backend, Store::open(&db).unwrap(), RuntimeConfig::default()).unwrap();
+    let r = cev.decide(&in_namespace("invoices broken", "acme")).unwrap();
+    cev.feedback(&label(&decision_id(&r.answers["team"]), Label::Text("tech".into()))).unwrap();
+    assert_eq!(cev.task("acme", "router").unwrap().examples, 1);
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let old: String = c.query_row("SELECT namespace FROM adapters WHERE model = 'm'", [], |r| r.get(0)).unwrap();
+    assert_eq!(old, "");
+    drop(c);
     let _ = std::fs::remove_dir_all(dir);
 }
 

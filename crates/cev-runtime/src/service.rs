@@ -51,6 +51,9 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskInfo {
     pub task: String,
+    /// Feedback bucket; empty for the default one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
     pub examples: u64,
     pub buffered: usize,
     pub active: bool,
@@ -64,7 +67,8 @@ pub struct Cev {
     backend: Arc<dyn Backend>,
     store: Store,
     cfg: RuntimeConfig,
-    adapters: Mutex<HashMap<String, Adapter>>,
+    /// Online adapters by (namespace, task).
+    adapters: Mutex<HashMap<(String, String), Adapter>>,
     normalizer: Mutex<Normalizer>,
     /// Content-free calibration logits by question-variant prompt. They do not
     /// depend on the state, so repeated question sets pay for them once.
@@ -104,6 +108,19 @@ impl<V: Clone> LruMap<V> {
     }
 }
 
+/// Wire namespace to stored namespace: absent or blank is the default bucket.
+fn namespace_key(ns: Option<&str>) -> CevResult<String> {
+    let ns = ns.map(str::trim).unwrap_or_default();
+    if ns.len() > 200 {
+        return Err(CevError::BadRequest("`namespace` is longer than 200 bytes".into()));
+    }
+    Ok(ns.to_string())
+}
+
+fn namespace_wire(ns: &str) -> Option<String> {
+    (!ns.is_empty()).then(|| ns.to_string())
+}
+
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::now_v7().simple())
 }
@@ -114,10 +131,10 @@ impl Cev {
         let dim = backend.hidden_size();
         let normalizer = store.load_normalizer(&model)?.filter(|n| n.mean.len() == dim).unwrap_or_else(|| Normalizer::new(dim));
         let mut adapters = HashMap::new();
-        for (task, mut a) in store.load_adapters(&model)? {
+        for (namespace, task, mut a) in store.load_adapters(&model)? {
             if a.dim == dim {
-                a.set_buffer(store.replay(&model, &task, cfg.learn.buffer)?);
-                adapters.insert(task, a);
+                a.set_buffer(store.replay(&model, &namespace, &task, cfg.learn.buffer)?);
+                adapters.insert((namespace, task), a);
             }
         }
         tracing::info!(model, adapters = adapters.len(), "runtime ready");
@@ -146,6 +163,7 @@ impl Cev {
     /// Answer every question of a request. Blocking (runs the network).
     pub fn decide(&self, req: &SystemOneRequest) -> CevResult<SystemOneResponse> {
         let started = Instant::now();
+        let namespace = namespace_key(req.namespace.as_deref())?;
         let compiled = compile(req, self.backend.codes(), self.backend.format()).map_err(|e| CevError::BadRequest(e.to_string()))?;
         let out = self.run_debiased(&compiled, req.debias.unwrap_or(self.cfg.debias))?;
         let model = self.backend.id().to_string();
@@ -161,7 +179,7 @@ impl Cev {
                 norm.observe(&r.hidden);
                 let names: Vec<String> = q.options.iter().map(|o| o.name.clone()).collect();
                 let base = math::softmax(&r.logits);
-                let adapter = adapters.get(&q.task).filter(|a| self.cfg.online_learning && a.is_active(&self.cfg.learn));
+                let adapter = adapters.get(&(namespace.clone(), q.task.clone())).filter(|a| self.cfg.online_learning && a.is_active(&self.cfg.learn));
                 let served = match adapter {
                     Some(a) => a.predict(&names, &r.logits, &norm.features(&r.hidden)),
                     None => base.clone(),
@@ -170,6 +188,7 @@ impl Cev {
                 let meta = AnswerMeta {
                     decision_id: decision_id.clone(),
                     task: q.task.clone(),
+                    namespace: namespace_wire(&namespace),
                     adapted: adapter.is_some(),
                     base_probabilities: adapter.map(|_| base.iter().map(|p| (p * 1e6).round() / 1e6).collect()),
                 };
@@ -180,6 +199,7 @@ impl Cev {
                     question_id: q.id.clone(),
                     model: model.clone(),
                     task: q.task.clone(),
+                    namespace: namespace.clone(),
                     kind: q.kind,
                     question: req.questions[&q.id].clone(),
                     options: q.options.clone(),
@@ -326,7 +346,7 @@ impl Cev {
         let served_loss = y.as_ref().map(|y| math::log_loss(&d.served, y));
         let learned = match (&y, &d.hidden) {
             (Some(y), Some(h)) if self.cfg.online_learning && d.model == self.backend.id() => {
-                self.learn(&d.task, Sample {
+                self.learn(&d.namespace, &d.task, Sample {
                     decision_id: d.decision_id.clone(),
                     names: d.options.iter().map(|o| o.name.clone()).collect(),
                     logits: d.base_logits.clone(),
@@ -338,10 +358,11 @@ impl Cev {
             }
             _ => false,
         };
-        let info = self.task(&d.task);
+        let info = self.task(&d.namespace, &d.task);
         Ok(FeedbackResponse {
             feedback_id,
             decision_id: d.decision_id,
+            namespace: namespace_wire(&d.namespace),
             task: d.task,
             served_loss,
             learned,
@@ -350,12 +371,14 @@ impl Cev {
         })
     }
 
-    fn learn(&self, task: &str, s: Sample) -> CevResult<()> {
+    fn learn(&self, namespace: &str, task: &str, s: Sample) -> CevResult<()> {
         let norm = self.normalizer.lock().clone();
         let mut adapters = self.adapters.lock();
-        let a = adapters.entry(task.to_string()).or_insert_with(|| Adapter::new(self.backend.hidden_size()));
+        let a = adapters
+            .entry((namespace.to_string(), task.to_string()))
+            .or_insert_with(|| Adapter::new(self.backend.hidden_size()));
         a.learn(s, &norm, &self.cfg.learn);
-        self.store.save_adapter(self.backend.id(), task, a)?;
+        self.store.save_adapter(self.backend.id(), namespace, task, a)?;
         drop(adapters);
         self.store.save_normalizer(self.backend.id(), &norm)?;
         Ok(())
@@ -376,6 +399,7 @@ impl Cev {
                 questions: ex.questions.clone(),
                 no_store: false,
                 debias: None,
+                namespace: ex.namespace.clone(),
             })?;
             let mut fbs = Vec::new();
             for (qid, label) in &ex.labels {
@@ -394,20 +418,28 @@ impl Cev {
         Ok(out)
     }
 
-    pub fn tasks(&self) -> Vec<TaskInfo> {
+    /// Every adapter, or only those of one namespace (`""` is the default).
+    pub fn tasks(&self, namespace: Option<&str>) -> Vec<TaskInfo> {
         let adapters = self.adapters.lock();
-        let mut v: Vec<TaskInfo> = adapters.iter().map(|(k, a)| self.info(k, a)).collect();
-        v.sort_by(|a, b| a.task.cmp(&b.task));
+        let mut v: Vec<TaskInfo> = adapters
+            .iter()
+            .filter(|((ns, _), _)| namespace.is_none_or(|n| n.trim() == ns))
+            .map(|((ns, t), a)| self.info(ns, t, a))
+            .collect();
+        v.sort_by(|a, b| (&a.namespace, &a.task).cmp(&(&b.namespace, &b.task)));
         v
     }
 
-    pub fn task(&self, task: &str) -> Option<TaskInfo> {
-        self.adapters.lock().get(task).map(|a| self.info(task, a))
+    /// One task's adapter in a namespace (`""` is the default).
+    pub fn task(&self, namespace: &str, task: &str) -> Option<TaskInfo> {
+        let ns = namespace.trim();
+        self.adapters.lock().get(&(ns.to_string(), task.to_string())).map(|a| self.info(ns, task, a))
     }
 
-    fn info(&self, task: &str, a: &Adapter) -> TaskInfo {
+    fn info(&self, namespace: &str, task: &str, a: &Adapter) -> TaskInfo {
         TaskInfo {
             task: task.to_string(),
+            namespace: namespace.to_string(),
             examples: a.examples,
             buffered: a.buffer_len(),
             active: self.cfg.online_learning && a.is_active(&self.cfg.learn),
@@ -417,10 +449,11 @@ impl Cev {
         }
     }
 
-    /// Drop a task's adapter (labels stay in the log).
-    pub fn reset_task(&self, task: &str) -> CevResult<bool> {
-        let had = self.adapters.lock().remove(task).is_some();
-        Ok(self.store.delete_adapter(self.backend.id(), task)? || had)
+    /// Drop a task's adapter in one namespace (labels stay in the log).
+    pub fn reset_task(&self, namespace: &str, task: &str) -> CevResult<bool> {
+        let ns = namespace.trim();
+        let had = self.adapters.lock().remove(&(ns.to_string(), task.to_string())).is_some();
+        Ok(self.store.delete_adapter(self.backend.id(), ns, task)? || had)
     }
 
     pub fn decision(&self, id: &str) -> CevResult<Option<(DecisionRecord, Vec<FeedbackRecord>)>> {
