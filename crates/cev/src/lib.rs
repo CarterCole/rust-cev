@@ -251,7 +251,7 @@ impl Cev {
 
     /// Start a multi-question request about `state`.
     pub fn ask(&self, state: &impl Serialize) -> Ask {
-        Ask { cev: self.clone(), state: serde_json::to_value(state).unwrap_or(Value::Null), questions: IndexMap::new() }
+        Ask { cev: self.clone(), state: serde_json::to_value(state).unwrap_or(Value::Null), questions: IndexMap::new(), images: Vec::new(), audio: None }
     }
 
     /// Yes/no as a `bool` (probability ≥ 0.5). The probability is on `.probability()`.
@@ -304,9 +304,27 @@ pub struct Ask {
     cev: Cev,
     state: Value,
     questions: IndexMap<String, Question>,
+    images: Vec<String>,
+    audio: Option<String>,
 }
 
 impl Ask {
+    /// Attach an encoded image (PNG, JPEG, WebP or GIF bytes) every question
+    /// sees. Needs an image-capable backend (d1, d1-omni, d3).
+    pub fn image(mut self, bytes: &[u8]) -> Self {
+        use base64::Engine as _;
+        self.images.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+        self
+    }
+
+    /// Attach one WAV clip every question hears. Needs an audio-capable
+    /// backend (d1-omni).
+    pub fn audio(mut self, wav: &[u8]) -> Self {
+        use base64::Engine as _;
+        self.audio = Some(base64::engine::general_purpose::STANDARD.encode(wav));
+        self
+    }
+
     fn push<T>(&mut self, kind: QuestionType, instructions: &str, criteria: Option<Value>, task: Option<&str>) -> Handle<T> {
         let id = format!("q{}", self.questions.len());
         self.questions.insert(
@@ -341,6 +359,8 @@ impl Ask {
             no_store: self.cev.no_store,
             debias: self.cev.debias,
             namespace: self.cev.namespace.clone(),
+            images: self.images,
+            audio: self.audio,
         };
         let resp = self.cev.system_one(req).await?;
         Ok(Answers { cev: self.cev, resp })

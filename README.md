@@ -8,7 +8,7 @@ cev is a from-scratch Rust take on TypeSafe's [Jev / System One](https://typesaf
 - **choice** asks "which of these?" and returns an option plus a distribution.
 - **score** asks "which level?" and returns the expected level plus a distribution.
 
-The wire format is compatible with `POST /v1/systemone`, so existing Jev SDKs work. On top of that, cev adds:
+The wire format is compatible with `POST /v1/systemone`, so existing Jev SDKs work. cev runs its own zero-shot readout on any Qwen3 / Qwen3.5 checkpoint, and it runs the open decision models natively, with their own prompts and readout heads, weights pulled from Hugging Face (see [Models](#models)): Bespoke **Nimble**, Jared Palmer's **Kev**, the vLLM Semantic Router's **d3**, and Liquid's **d1** and **d1-omni**, including their image and audio inputs. On top of that, cev adds:
 
 - **A decision log.** Every answer has a `decision_id` and is stored with its full context: the state, the question, the exact prompt text, the logits, and what was served.
 - **Feedback.** Labels are attached by id and can always be exported as training data.
@@ -22,8 +22,8 @@ state ─┐
        ├─ compile ─▶ "<system> <evidence>{state}</evidence>"   shared prefix (LRU-cached)
        │             "Question … Options: A. … B. …"            one suffix per question (+ rotated variants),
 questions                                                        all packed into ONE block-masked pass
-                               │
-                      Qwen3 (candle, Metal/CUDA/CPU)
+   + images / audio            │
+            Qwen3 · Qwen3.5 · LFM2 (candle, Metal/CUDA/CPU)
                                │  next-token logits of the answer codes only ("A", "B", …, up to 255)
                                ▼
           z = debiased log-scores (rotations averaged, minus content-free "N/A" baseline)
@@ -36,15 +36,64 @@ questions                                                        all packed into
                                /v1/feedback {decision_id, label} ──┘──▶ adapter update, /v1/export ──▶ PyTorch LoRA
 ```
 
-- **Backbone.** Any Qwen3 safetensors checkpoint: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B` (default), `Qwen/Qwen3-4B-Instruct-2507`, or a directory produced by `training/train_lora.py`. There is no custom head. The answer is the LM's own next-token distribution restricted to one-token option codes, so zero-shot works on day one and an out-of-type answer is impossible. The code vocabulary is checked against the tokenizer at startup.
+- **Backbone.** Any Qwen3 or Qwen3.5 safetensors checkpoint (`Qwen/Qwen3-1.7B` is the default), or a directory produced by `training/train_lora.py`. There is no custom head. The answer is the LM's own next-token distribution restricted to one-token option codes, so zero-shot works on day one and an out-of-type answer is impossible. The code vocabulary is checked against the tokenizer at startup. The decision models below bring their own prompt and readout instead; the rest of the pipeline (log, feedback, adapters, export) is the same.
 - **One pass per request.** Everything goes into a single forward pass under an additive mask:
   - the (uncached tail of the) state,
   - every question,
   - every debiasing variant.
 
-  Each question sees the state and itself only, with positions restarting per question. That is exactly equivalent to asking each question alone. States longer than 512 tokens prefill their head in chunks first. Prefixes are LRU-cached across requests. On Metal, attention uses candle's fused SDPA kernel with native GQA.
-- **Parity.** In f32, cev matches HF transformers to |Δp| < 5e-5 on CPU and Metal (`training/parity.py`).
+  Each question sees the state and itself only, with positions restarting per question. That is exactly equivalent to asking each question alone. States longer than 512 tokens prefill their head in chunks first. Prefixes are LRU-cached across requests. On Metal, attention uses candle's fused SDPA kernel with native GQA. Models with recurrent layers (Qwen3.5's Gated DeltaNet, LFM2's short convolutions) cannot take a packed block mask, so there the state prefix runs once into a cached state (keys and values, recurrent matrices, conv tails) and every question runs as one row of a right-padded batch continuing from it, which is the same computation.
+- **Parity.** In f32, cev matches HF transformers to |Δp| < 5e-5 on CPU and Metal (`training/parity.py`), and each decision model matches a PyTorch reference built from its published parts to |Δp| ≲ 1e-5 on text (see [Models](#models)).
 - **Confidence.** Uses TypeSafe's definitions. For choice: `(p_max − 1/K)/(1 − 1/K)`. For score: `1 − E|level − mode|/(K−1)`.
+
+## Models
+
+`--model` takes a Hugging Face repo id, a local directory, or one of the short names below (the tags follow ollama.com). Weights are found in the Hugging Face cache or downloaded to `~/.cache/cev/models`; adapters pull their pinned base too.
+
+| `--model` | Weights | Architecture | Answers come from | Takes | Context |
+|---|---|---|---|---|---|
+| `Qwen/Qwen3-*`, `Qwen/Qwen3.5-*` | any Qwen3 / Qwen3.5 checkpoint | Qwen3 dense; Qwen3.5 hybrid Gated DeltaNet + gated attention | cev's prompt, LM logits of one-token codes (zero-shot, debiased) | text, images (Qwen3.5) | model's |
+| `nimble-v3` (`nimble-v3:9b`, `:27b`) | `bespokelabs/Bespoke-Nimble-9B-v3` LoRA on `Qwen/Qwen3.5-9B`, merged at load | Qwen3.5 | LM logits of code tokens over a JSON schema of all questions | text | 32k |
+| `kev` (`kev:0.8b`, `:4b`, `:9b`) | `jaredpalmer/kev-*` LoRA + `head.pt` on `Qwen/Qwen3.5-*-Base`, merged at load | Qwen3.5 | pointer head: each option's `<\|box_end\|>` against the `<\|fim_suffix\|>` decision token, with the checkpoint's temperature | text | 64k state |
+| `d3` (`d3:2b`, `:4b`, `:8b`, `:27b`) | `vllm-sr/d3-nano` / `d3-mini` / `d3-flash` / `d3` | Qwen3.5, attention run bidirectionally over the whole prompt | a 255-way `readout.safetensors` matrix at the last position | text, images (Qwen3.5 vision tower, up to 1.6 MP each) | package's |
+| `d1` (`d1:2b`, `:3b`) | `LiquidAI/d1-3B` (LFM2.5-VL) | LFM2 short-conv + GQA hybrid, SigLIP2 NaFlex tower | LM logits of option codes / yes-no / digits, best of each spelling | text, images (512 px tiles + thumbnail) | 32k |
+| `d1-omni` (`:600m`, `:2b`) | `LiquidAI/d1-omni-600M` | bidirectional LFM2.5 encoder trunk, decision head over `<\|mask\|>` markers, SigLIP2 and FastConformer encoders | the decision head, with per-type temperatures | text, images, audio (16 kHz mono WAV, 30 s) | 16k; 896 text tokens with images |
+
+What is checked (`cargo test --release -p cev-model --test parity_models --test parity_vision`, with the reference files from `training/parity/dump_*.py`): the largest difference in any option's probability over the same requests, against f32 PyTorch.
+
+| Model | Reference | Text | Images | Audio | Metal f32 | Metal bf16 |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B decoder | HF transformers hidden states and logits | rel. err 5e-6 (1095-token prompt, prefix state, padded rows) | | | | |
+| `kev:0.8b` | PEFT merge + the pointer head from `head.pt` | 3e-6 | | | 2e-6 | 9e-3 |
+| `nimble-v3` (9B) | PEFT merge on `Qwen3.5-9B` + Nimble's schema prompt | 3e-6 | | | 3e-6 | 4e-3 |
+| `d3:2b` | Qwen3.5 with d3's bidirectional attention + `readout.safetensors` | 4e-6 | 5e-6 | | 1e-5 | 5e-3; image 2.3e-2 |
+| `d1:3b` | HF `Lfm2VlForConditionalGeneration` + d1's prompt | 2e-6 | 2e-7 | | 7e-6 | 5e-3 |
+| `d1-omni` | the model's math re-stated over its weights | 2e-6 | 4e-6 | 2e-8 | 8e-6 | 2.5e-2 |
+
+The first three result columns are f32 on the CPU. Image preprocessing reproduces the processors' 8-bit antialiased resizing (torchvision's) and tiling, so pictures match too. bf16 moves probabilities by up to about 0.01 on text and 0.025 on images: Qwen3.5's vision tower grows a few channels past 5,000, where bf16 resolves steps of 32, so tokens with small outputs drift. `--dtype f32` gives the exact numbers; `--dtype auto` picks bf16 on Metal for checkpoints over 4 GB, which includes `d3:2b` and the 9B models. Kev-27B (Qwen3.8) and d3's video input are not supported.
+
+Latency on an M4 Max through the server, 3 questions, `--dtype auto` (`scripts/bench_models.sh metal <model>…`, which runs `scripts/bench.py`). "Cached" means the state was seen before. Token counts include each family's own prompt and, for cev's zero-shot readout, its debiasing variants.
+
+| Model | short state: tokens, cached / uncached | long state (~2k-token history): tokens, cached / uncached |
+|---|---:|---:|
+| `Qwen/Qwen3-1.7B` (cev, f32) | 571 tok, 158 / 190 ms | 2648 tok, 213 / 1154 ms |
+| `Qwen/Qwen3.5-0.8B` (cev, f32) | 598 tok, 425 / 516 ms | 2757 tok, 695 / 2018 ms |
+| `kev:0.8b` (f32) | 111 tok, 82 / 129 ms | 2264 tok, 145 / 1266 ms |
+| `nimble-v3` (9B, bf16) | 379 tok, 185 / 1031 ms | 2453 tok, 194 / 5329 ms |
+| `d3:2b` (bf16) | 400 tok, 305 / 340 ms | 6382 tok, 3938 / 3904 ms |
+| `d1:3b` (f32) | 155 tok, 104 / 143 ms | 2242 tok, 112 / 1138 ms |
+| `d1-omni` (f32) | 229 tok, 35 / 39 ms | 6481 tok, 698 / 791 ms |
+
+- The uncached long-state times of the hybrid models are dominated by the Gated DeltaNet prefill, a sequential scan over 64-token chunks written in plain candle ops. A fused Metal kernel for it is the obvious next speed-up.
+- d3 and d1-omni attend bidirectionally, so each question is a full row over the whole state and nothing is cached; their cost grows with questions × state length.
+
+Notes per family:
+
+- **Debiasing** (below) defaults to `full` for cev's own zero-shot readout and `none` for the trained decision models (`--debias auto`). Nimble's prompt lists every question's options in one schema, so option rotation is refused for it; `calibrate` works.
+- **Prefix caching** applies to the causal models. d3 runs its attention bidirectionally over the whole prompt, so each question is one full row and nothing is cached between requests. d1-omni's trunk is bidirectional too.
+- **Images** go through each family's own processor rules: Qwen3.5 `smart_resize` to multiples of 32 within 65,536 to 1,638,400 pixels; LFM2-VL's 512 px tiles (2 to 10) plus a thumbnail, 64 to 256 tokens per crop. d1-omni's image questions use the plain softmax, as in its reference code.
+- **Audio** (d1-omni) is one WAV clip; other sample rates and stereo are resampled and mixed down. A request carries images or audio, not both.
+- **Export** rows carry the exact prompt each family saw (`prefix` + `suffix`), so `/v1/export` still trains the right template; `codes` is empty for the pointer and marker readouts.
 
 ### Debiasing
 
@@ -52,7 +101,7 @@ Small instruct models have a strong option-position bias. Zero-shot Qwen3-1.7B p
 
 - **`calibrate`: contextual calibration.** cev subtracts the log-probabilities the model gives the same question over content-free evidence ("N/A"). Those logits don't depend on the state, so they are cached per question and are free after the first request with a given question set.
 - **`permute`: rotation averaging.** cev averages over up to `--max-permutations` (default 4) cyclic rotations of the option order. The rotations are packed into the same pass.
-- **`full`** (default) applies both. **`none`** returns the raw distribution.
+- **`full`** applies both. **`none`** returns the raw distribution. **`auto`** (the default) is `full` for cev's own zero-shot readout and `none` for the trained decision models.
 
 Zero-shot accuracy on small built-in tasks (`scripts/eval_zero_shot.py`):
 
@@ -111,14 +160,17 @@ cev --model ./ckpt/v1
 ## Run
 
 ```bash
-cargo run --release -p cev-server --features metal -- --model Qwen/Qwen3-1.7B   # macOS
-cargo run --release -p cev-server --features cuda  -- --model Qwen/Qwen3-4B-Instruct-2507
+cargo run --release -p cev-server --features metal -- --model Qwen/Qwen3-1.7B   # macOS, cev's zero-shot readout
+cargo run --release -p cev-server --features metal -- --model kev:4b           # Kev on Qwen3.5-4B-Base
+cargo run --release -p cev-server --features metal -- --model d1               # Liquid d1-3B, text and images
+cargo run --release -p cev-server --features metal -- --model d1-omni          # text, images and audio
+cargo run --release -p cev-server --features cuda  -- --model d3:8b
 cargo run --release -p cev-server -- --mock        # no model; keyword stub for wiring tests
 ```
 
 From crates.io, `cargo install cev-server --features metal` (or `cuda`) installs the same binary as `cev`.
 
-Weights come from a local directory or the Hugging Face cache, or are downloaded into `~/.cache/cev/models`. The `--dtype auto` default picks f32 on CPU, and on Metal for checkpoints up to 4 GB; otherwise it picks bf16.
+Weights come from a local directory or the Hugging Face cache (`hf download`), or are downloaded into `~/.cache/cev/models` (`HF_TOKEN` is used when set). The `--dtype auto` default picks f32 on CPU, and on Metal for checkpoints up to 4 GB; otherwise it picks bf16. `GET /v1/models` reports the family and modalities that were loaded.
 
 Other flags:
 
@@ -130,7 +182,7 @@ Other flags:
 | `--no-online-learning` | off | Only store labels; don't adapt |
 | `--no-store-features` | off | Don't store hidden states |
 | `--min-examples` | 8 | Labels needed before an adapter can be served |
-| `--debias` | `full` | Debias mode: `none`, `calibrate`, `permute` or `full` |
+| `--debias` | `auto` | Debias mode: `auto`, `none`, `calibrate`, `permute` or `full` |
 
 Each flag has a matching `CEV_*` environment variable.
 
@@ -177,8 +229,8 @@ int8 halves the download and memory but is not faster: 70–85% of the time is t
 
 | Method | Path | |
 |---|---|---|
-| POST | `/v1/systemone` | Jev-compatible decide. Extensions: `task` per question, `namespace`, `no_store`, `debias`; `request_id`, `latency_ms`, and `x_cev.decision_id` in the response |
-| GET | `/v1/models` | Backbone, code vocabulary size, prompt version |
+| POST | `/v1/systemone` | Jev-compatible decide. Extensions: `task` per question, `namespace`, `no_store`, `debias`, `images` (base64 or data URLs, every question sees them), `audio` (one base64 WAV); `request_id`, `latency_ms`, and `x_cev.decision_id` in the response |
+| GET | `/v1/models` | Backbone, family, modalities, options per question, prompt version |
 | POST | `/v1/feedback` | `{decision_id \| request_id+question_id, label?, weight?, comment?, metadata?}` |
 | POST | `/v1/examples` | `{examples: [{state, questions, labels, namespace?}]}`: decide, then learn from the labels |
 | GET | `/v1/decisions?task=&namespace=&limit=&offset=` | Recent decisions |
@@ -206,6 +258,19 @@ curl -s localhost:8080/v1/systemone -H 'content-type: application/json' -d '{
   }}'
 curl -s localhost:8080/v1/feedback -H 'content-type: application/json' \
   -d '{"decision_id": "dec_…", "label": 2, "comment": "user is fully blocked", "metadata": {"by": "agent-7"}}'
+```
+
+With a model that takes them, pictures and sound go in the same request; a question can be about the media alone:
+
+```bash
+curl -s localhost:8080/v1/systemone -H 'content-type: application/json' -d "{
+  \"state\": \"Receipt photographed by the customer\",
+  \"images\": [\"$(base64 -i receipt.jpg)\"],
+  \"questions\": {\"total_over_100\": {\"type\": \"noul\", \"instructions\": \"Is the total above 100?\"}}}"
+curl -s localhost:8080/v1/systemone -H 'content-type: application/json' -d "{
+  \"state\": null, \"audio\": \"$(base64 -i clip.wav)\",
+  \"questions\": {\"intent\": {\"type\": \"choice\", \"instructions\": \"What does the caller want?\",
+                  \"criteria\": {\"refund\": null, \"support\": null, \"sales\": null}}}}"
 ```
 
 ### GraphQL
@@ -258,6 +323,9 @@ let mut q = cev.ask(&ticket);
 let (t, s, r) = (q.choose::<Team>("Which team?"), q.score::<Severity>("How severe?"), q.check("Refund?"));
 let a = q.send().await?;
 let (team, severity, refund) = (a.get(t)?, a.get(s)?, a.get(r)?);
+
+// pictures and sound (with a model that takes them)
+let a = cev.ask(&"a receipt").image(&std::fs::read("receipt.jpg")?).send().await?;
 ```
 
 How the derive maps an enum:
@@ -273,21 +341,22 @@ A full in-process example: `cargo run --release -p cev-rs --features local,metal
 | Crate | |
 |---|---|
 | `cev-core` | Wire types, prompt compiler, answer math, label → target, the `Backend` trait and a mock |
-| `cev-model` | candle Qwen3 (prefill-only, shared-prefix KV, packed block-masked questions), weight resolution |
+| `cev-model` | candle backbones: Qwen3 (packed block-masked questions), Qwen3.5 (Gated DeltaNet + gated attention, vision tower), LFM2 / LFM2.5 (d1, d1-omni trunk), SigLIP2, FastConformer audio; the family readouts (codes, d3 matrix, Kev pointer head, d1 token groups, d1-omni decision head); LoRA merging; weight resolution and aliases |
 | `cev-runtime` | The decision service: SQLite log (in-memory on wasm), feedback, online adapters, export |
 | `cev-server` | `cev` binary: axum REST + async-graphql |
 | `cev-wasm`, `web/` | Browser demo: the same pipeline as a wasm module in a web worker, in-memory log |
 | `cev-rs`, `cev-derive` | Typed SDK, imported as `cev` (`http` and `local` transports) and `#[derive(Choice)]` |
-| `training/` | PyTorch: `train_lora.py` (fine-tune from export), `parity.py` (check cev against transformers) |
+| `training/` | PyTorch: `train_lora.py` (fine-tune from export), `parity.py` (check cev against transformers), `parity/dump_*.py` (reference answers for each decision model) |
 
 Tests:
 
 - `cargo test --workspace --features cev-rs/local` runs everything against the mock backend, with no weights needed.
 - `training/parity.py` checks the real network against transformers.
+- `training/parity/dump_{qwen35,qwen35_vision,kev,d3,d1,omni_ref,nimble}.py` write reference answers (the 9B Nimble run needs about 40 GB of RAM); `CEV_PARITY_<NAME>=<file> cargo test --release -p cev-model --test parity_models --test parity_vision -- --nocapture` compares cev to them (`CEV_PARITY_DEVICE=metal`, `CEV_PARITY_DTYPE=bf16` for the accelerator paths).
 
 ## Status / next
 
-- Qwen3 dense only. Next: quantized (GGUF) Qwen3, Qwen3-MoE, and Qwen3.5 (hybrid DeltaNet), which the kev weights use.
+- Qwen3 dense, Qwen3.5 dense hybrids and LFM2 / LFM2.5. Next: a fused Metal/CUDA kernel for the Gated DeltaNet prefill, quantized (GGUF) weights, Qwen3-MoE, Qwen3.8 (Kev-27B), and d3's video input.
 - An explicit "insufficient evidence" option, and building the attention mask on the GPU for very long states.
 - Larger option sets through an embedding shortlist before scoring.
 - Per-tenant isolation for adapters and logs.

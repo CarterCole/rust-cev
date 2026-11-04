@@ -9,7 +9,8 @@ fn main() -> anyhow::Result<()> {
         device: args.get(2).cloned().unwrap_or("auto".into()),
         ..Default::default()
     })?;
-    println!("codes: {} (first {:?}, last {:?}) think_stub={}", engine.codes().len(), &engine.codes()[..3], engine.codes().last(), engine.format().think_stub);
+    let caps = engine.capabilities();
+    println!("family {} max_options {} modalities {:?}", caps.family.as_str(), caps.max_options, caps.modalities());
     let req = serde_json::from_value(serde_json::json!({
         "state": "Hi, I was charged twice for my subscription this month. Please refund the duplicate charge. The app works fine otherwise.",
         "questions": {
@@ -20,7 +21,7 @@ fn main() -> anyhow::Result<()> {
             "urgency": {"type": "score", "instructions": "How urgent is this ticket?", "criteria": ["Not urgent", "Somewhat urgent", "Very urgent"]}
         }
     }))?;
-    let c = compile(&req, engine.codes(), engine.format())?;
+    let c = compile(&req, caps.max_options)?;
     for round in 0..3 {
         let t = std::time::Instant::now();
         let out = engine.run(&c)?;

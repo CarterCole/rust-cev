@@ -8,7 +8,11 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn app(key: Option<&str>) -> axum::Router {
-    let cev = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    app_with(MockBackend::default(), key)
+}
+
+fn app_with(backend: MockBackend, key: Option<&str>) -> axum::Router {
+    let cev = Cev::new(Arc::new(backend), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
     cev_server::app(cev_server::AppState::new(cev, 1, key.map(String::from)))
 }
 
@@ -102,4 +106,29 @@ async fn bearer_auth() {
     assert_eq!(s, StatusCode::OK);
     let (s, _, _) = call(&app, "GET", "/health", None).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn images_and_audio_on_the_wire() {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nstub");
+    let body = json!({
+        "state": "a receipt",
+        "images": [format!("data:image/png;base64,{png}"), png],
+        "questions": {"total": {"type": "noul", "instructions": "Is the total above 100?"}}
+    });
+    // Text-only backbone: a 400 that names the field.
+    let (s, _, text) = call(&app(None), "POST", "/v1/systemone", Some(body.clone())).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(text.contains("images"), "{text}");
+    // Image-capable backbone: answered, and the model advertises its modalities.
+    let app = app_with(MockBackend::default().with_media(), None);
+    let (s, r, _) = call(&app, "POST", "/v1/systemone", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert!(r["answers"]["total"]["noul"].is_number());
+    let (s, m, _) = call(&app, "GET", "/v1/models", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let model = if m["data"].is_array() { m["data"][0].clone() } else { m.clone() };
+    assert_eq!(model["modalities"], json!(["text", "image", "audio"]));
+    assert_eq!(model["family"], "cev");
 }

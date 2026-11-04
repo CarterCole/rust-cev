@@ -46,6 +46,7 @@ impl From<QuestionType> for Kind {
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
 pub enum DebiasMode {
+    Auto,
     None,
     Calibrate,
     Permute,
@@ -55,6 +56,7 @@ pub enum DebiasMode {
 impl From<DebiasMode> for cev_core::Debias {
     fn from(d: DebiasMode) -> Self {
         match d {
+            DebiasMode::Auto => cev_core::Debias::Auto,
             DebiasMode::None => cev_core::Debias::None,
             DebiasMode::Calibrate => cev_core::Debias::Calibrate,
             DebiasMode::Permute => cev_core::Debias::Permute,
@@ -172,6 +174,10 @@ pub struct StoredDecision {
 pub struct Model {
     pub id: String,
     pub backbone: String,
+    /// Decision-model family: cev, nimble, kev, d3, d1 or d1-omni.
+    pub family: String,
+    /// text, plus image and/or audio when the backend takes them.
+    pub modalities: Vec<String>,
     pub hidden_size: u64,
     pub max_options: u64,
     pub prompt_version: String,
@@ -239,7 +245,7 @@ pub struct QueryRoot;
 impl QueryRoot {
     async fn model(&self, ctx: &Context<'_>) -> Model {
         let m = state(ctx).cev.model_info();
-        Model { id: m.id, backbone: m.backbone, hidden_size: m.hidden_size as u64, max_options: m.max_options as u64, prompt_version: m.prompt_version }
+        Model { id: m.id, backbone: m.backbone, family: m.family, modalities: m.modalities, hidden_size: m.hidden_size as u64, max_options: m.max_options as u64, prompt_version: m.prompt_version }
     }
 
     async fn stats(&self, ctx: &Context<'_>) -> Result<Stats> {
@@ -322,6 +328,8 @@ impl MutationRoot {
         #[graphql(default = false)] no_store: bool,
         debias: Option<DebiasMode>,
         #[graphql(desc = "Feedback bucket: labels on these decisions only adapt answers in it.")] namespace: Option<String>,
+        #[graphql(desc = "Base64 images (optionally data URLs) every question sees; needs an image-capable backend.")] images: Option<Vec<String>>,
+        #[graphql(desc = "One base64 WAV clip every question hears; needs an audio-capable backend.")] audio: Option<String>,
     ) -> Result<DecideResult> {
         let mut qs = IndexMap::new();
         for q in questions {
@@ -331,7 +339,7 @@ impl MutationRoot {
             }
         }
         let resp = state(ctx)
-            .decide(SystemOneRequest { state: state_.0, model: None, questions: qs, no_store, debias: debias.map(Into::into), namespace })
+            .decide(SystemOneRequest { state: state_.0, model: None, questions: qs, no_store, debias: debias.map(Into::into), namespace, images: images.unwrap_or_default(), audio })
             .await
             .map_err(gql_err)?;
         Ok(DecideResult {

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Neural backend for cev (Calibrated Enum Verdicts): a prefill-only Qwen3 decoder in candle that reads typed answers from option-code logits."
+description = "Neural backend for cev (Calibrated Enum Verdicts): prefill-only decoders in candle (Qwen3, Qwen3.5, LFM2) that read typed answers from option logits, pointer heads and decision heads."
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -29,6 +29,10 @@ rayon = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true, features = ["onig"] }
 ureq = "3"
+zip = { version = "8", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+hound = "3"
+rustfft = "6"
 
 # In the browser: pure-Rust regex, and weights arrive as fetched bytes.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -37,3 +41,5 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 half = "2"
+tracing-subscriber.workspace = true
+base64 = "0.22"

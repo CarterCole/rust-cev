@@ -205,3 +205,27 @@ fn debias_rotations_map_back_to_canonical_options() {
     }
     assert!(plain[4] > plain[0] && plain[0] > plain[2]);
 }
+
+#[test]
+fn media_is_decoded_and_checked_against_the_backend() {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nnot really a picture");
+    let with_image = |text: &str| SystemOneRequest { images: vec![format!("data:image/png;base64,{png}")], ..request(text) };
+    // A text-only backend refuses pictures with a client error.
+    let cev = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let err = cev.decide(&with_image("invoices")).unwrap_err().to_string();
+    assert!(err.contains("`images`") && err.contains("text only"), "{err}");
+    // A backend that takes them gets the decoded bytes and reports its modalities.
+    let cev = Cev::new(Arc::new(MockBackend::default().with_media()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let info = cev.model_info();
+    assert_eq!(info.modalities, ["text", "image", "audio"]);
+    assert_eq!(info.family, "cev");
+    let r = cev.decide(&with_image("the invoices are wrong")).unwrap();
+    assert!(r.usage.input_tokens > 256, "image tokens counted: {}", r.usage.input_tokens);
+    let bad = SystemOneRequest { images: vec!["%%% not base64".into()], ..request("x") };
+    assert!(cev.decide(&bad).unwrap_err().to_string().contains("base64"));
+    // Audio needs an audio-capable backend too.
+    let cev = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let clip = SystemOneRequest { audio: Some(base64::engine::general_purpose::STANDARD.encode(b"RIFF....WAVE")), ..request("x") };
+    assert!(cev.decide(&clip).unwrap_err().to_string().contains("`audio`"));
+}

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use cev_core::{Backend, MockBackend};
-use cev_model::{Engine, EngineOptions};
+use cev_model::EngineOptions;
 use cev_runtime::{Cev, LearnConfig, RuntimeConfig, Store};
 use std::sync::Arc;
 
@@ -9,7 +9,9 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Args {
-    /// Backbone: Hugging Face repo id or local directory (Qwen3 safetensors).
+    /// Model: a Hugging Face repo id, a local directory, or a short name of a
+    /// decision model (`kev`, `kev:4b`, `nimble-v3`, `d3`, `d3:2b`, `d1`,
+    /// `d1-omni`). Plain Qwen3 / Qwen3.5 checkpoints run cev's own prompt.
     #[arg(long, env = "CEV_MODEL", default_value = "Qwen/Qwen3-1.7B")]
     model: String,
     /// Name reported as `model` in responses.
@@ -43,8 +45,10 @@ struct Args {
     /// Labels before an adapter may be served.
     #[arg(long, env = "CEV_MIN_EXAMPLES", default_value_t = 8)]
     min_examples: u64,
-    /// Position-bias correction: none | calibrate | permute | full.
-    #[arg(long, env = "CEV_DEBIAS", default_value = "full")]
+    /// Position-bias correction: auto | none | calibrate | permute | full.
+    /// `auto` is the model family's default: `full` for zero-shot code
+    /// readouts (plain Qwen checkpoints), `none` for trained decision models.
+    #[arg(long, env = "CEV_DEBIAS", default_value = "auto")]
     debias: String,
     /// Most option rotations per question when permuting.
     #[arg(long, env = "CEV_MAX_PERMUTATIONS", default_value_t = 4)]
@@ -71,15 +75,16 @@ async fn main() -> Result<()> {
             name: args.model_name.clone(),
             ..Default::default()
         };
-        Arc::new(tokio::task::spawn_blocking(move || Engine::load(opts)).await??)
+        tokio::task::spawn_blocking(move || cev_model::load(opts)).await??
     };
-    tracing::info!(model = backend.id(), codes = backend.codes().len(), "backbone loaded");
+    let caps = backend.capabilities();
+    tracing::info!(model = backend.id(), family = caps.family.as_str(), max_options = caps.max_options, modalities = ?caps.modalities(), "backbone loaded");
     let cfg = RuntimeConfig {
         online_learning: !args.no_online_learning,
         store_features: !args.no_store_features,
         learn: LearnConfig { min_examples: args.min_examples, ..Default::default() },
         debias: serde_json::from_value(serde_json::Value::String(args.debias.clone()))
-            .map_err(|_| anyhow::anyhow!("--debias must be none, calibrate, permute or full"))?,
+            .map_err(|_| anyhow::anyhow!("--debias must be auto, none, calibrate, permute or full"))?,
         max_permutations: args.max_permutations,
     };
     let cev = Cev::new(backend, Store::open(&args.db)?, cfg)?;

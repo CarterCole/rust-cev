@@ -70,7 +70,7 @@ mod tests {
     use super::*;
 
     fn opts(n: &[&str]) -> Vec<OptionSpec> {
-        n.iter().map(|s| OptionSpec { name: s.to_string(), text: s.to_string() }).collect()
+        n.iter().map(|s| OptionSpec { name: s.to_string(), text: s.to_string(), description: None }).collect()
     }
 
     #[test]

@@ -7,8 +7,8 @@
 use crate::adapter::{Adapter, LearnConfig, Normalizer, Sample};
 use crate::store::{DecisionRecord, ExportFilter, ExportRow, FeedbackRecord, RequestRecord, Store, StoreStats, now_ms};
 use cev_core::{
-    Answer, AnswerMeta, Backend, BackendOutput, CompiledRequest, Debias, ExamplesRequest, Readout, FeedbackRequest, FeedbackResponse, ModelInfo, SystemOneRequest,
-    SystemOneResponse, Usage, compile, math, target::target,
+    Answer, AnswerMeta, Backend, BackendOutput, CompiledRequest, Debias, ExamplesRequest, FeedbackRequest, FeedbackResponse, ModelInfo, Readout, SystemOneRequest,
+    SystemOneResponse, Usage, compile, content_free, math, target::target,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -36,7 +36,9 @@ pub struct RuntimeConfig {
     /// on feedback; costs 4 bytes x hidden size per decision).
     pub store_features: bool,
     pub learn: LearnConfig,
-    /// Default position-bias correction (requests may override).
+    /// Default position-bias correction (requests may override). `Auto` is
+    /// the backend's own default: `full` for zero-shot code readouts, `none`
+    /// for trained decision models.
     pub debias: Debias,
     /// Most option rotations evaluated per question when permuting.
     pub max_permutations: usize,
@@ -44,7 +46,7 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { online_learning: true, store_features: true, learn: LearnConfig::default(), debias: Debias::Full, max_permutations: 4 }
+        Self { online_learning: true, store_features: true, learn: LearnConfig::default(), debias: Debias::Auto, max_permutations: 4 }
     }
 }
 
@@ -150,13 +152,16 @@ impl Cev {
     }
 
     pub fn model_info(&self) -> ModelInfo {
+        let caps = self.backend.capabilities();
         ModelInfo {
             id: self.backend.id().into(),
             object: "model",
             backbone: self.backend.backbone().into(),
+            family: caps.family.as_str().into(),
+            modalities: caps.modalities().iter().map(|m| m.to_string()).collect(),
             hidden_size: self.backend.hidden_size(),
-            max_options: self.backend.codes().len(),
-            prompt_version: cev_core::compile::PROMPT_VERSION.into(),
+            max_options: caps.max_options,
+            prompt_version: caps.prompt_version().into(),
         }
     }
 
@@ -164,8 +169,19 @@ impl Cev {
     pub fn decide(&self, req: &SystemOneRequest) -> CevResult<SystemOneResponse> {
         let started = Instant::now();
         let namespace = namespace_key(req.namespace.as_deref())?;
-        let compiled = compile(req, self.backend.codes(), self.backend.format()).map_err(|e| CevError::BadRequest(e.to_string()))?;
-        let out = self.run_debiased(&compiled, req.debias.unwrap_or(self.cfg.debias))?;
+        let caps = self.backend.capabilities();
+        let compiled = compile(req, caps.max_options).map_err(|e| CevError::BadRequest(e.to_string()))?;
+        if !compiled.media.images.is_empty() && !caps.images {
+            return Err(CevError::BadRequest(format!("`images`: the {} backend `{}` takes text only", caps.family.as_str(), self.backend.id())));
+        }
+        if compiled.media.audio.is_some() && !caps.audio {
+            return Err(CevError::BadRequest(format!("`audio`: the {} backend `{}` does not take audio", caps.family.as_str(), self.backend.id())));
+        }
+        if compiled.media.audio.is_some() && !compiled.media.images.is_empty() && caps.family == cev_core::Family::D1Omni {
+            return Err(CevError::BadRequest("a request carries images or audio, not both".into()));
+        }
+        let debias = req.debias.unwrap_or(self.cfg.debias).resolve(caps.debias);
+        let out = self.run_debiased(&compiled, debias)?;
         let model = self.backend.id().to_string();
         let request_id = new_id("req");
         let now = now_ms();
@@ -203,8 +219,8 @@ impl Cev {
                     kind: q.kind,
                     question: req.questions[&q.id].clone(),
                     options: q.options.clone(),
-                    codes: q.codes.clone(),
-                    suffix: q.suffix.clone(),
+                    codes: r.codes.clone(),
+                    suffix: r.suffix.clone(),
                     base_logits: r.logits.clone(),
                     served,
                     adapted: adapter.is_some(),
@@ -220,7 +236,7 @@ impl Cev {
                     request_id: request_id.clone(),
                     model: model.clone(),
                     state: req.state.clone(),
-                    prefix: compiled.prefix.clone(),
+                    prefix: out.prefix.clone(),
                     input_tokens: out.input_tokens,
                     latency_ms,
                     created_at: now,
@@ -243,30 +259,30 @@ impl Cev {
 
     /// Run the backbone with position-bias correction. Returns one readout per
     /// question whose `logits` are debiased log-scores in canonical option
-    /// order and whose `hidden` comes from the unrotated prompt.
+    /// order and whose `hidden` (and prompt) come from the unrotated variant.
     fn run_debiased(&self, compiled: &CompiledRequest, debias: Debias) -> anyhow::Result<BackendOutput> {
         if debias == Debias::None {
             return self.backend.run(compiled);
         }
-        let fmt = self.backend.format();
         let mut variants = Vec::new();
         let mut spans = Vec::with_capacity(compiled.questions.len());
         for q in &compiled.questions {
             let start = variants.len();
             for shift in debias.shifts(q.options.len(), self.cfg.max_permutations) {
-                variants.push(if shift == 0 { q.clone() } else { q.rotated(shift, fmt) });
+                variants.push(if shift == 0 { q.clone() } else { q.rotated(shift) });
             }
             spans.push(start..variants.len());
         }
-        let main = CompiledRequest { prefix: compiled.prefix.clone(), questions: variants };
+        let main = CompiledRequest { questions: variants, ..compiled.clone() };
         // Calibration twins: same question variants over content-free evidence.
         // Cached ones are reused; the rest run fused with the request.
+        let keys: Vec<String> = main.questions.iter().map(|q| q.fingerprint()).collect();
         let mut cf: Vec<Option<Vec<f32>>> = vec![None; main.questions.len()];
         let mut missing = Vec::new();
         if debias.calibrates() {
             let mut cache = self.calibration.lock();
-            for (i, q) in main.questions.iter().enumerate() {
-                match cache.get(&q.suffix) {
+            for (i, key) in keys.iter().enumerate() {
+                match cache.get(key) {
                     Some(z) => cf[i] = Some(z),
                     None => missing.push(i),
                 }
@@ -275,15 +291,13 @@ impl Cev {
         let out = if missing.is_empty() {
             self.backend.run(&main)?
         } else {
-            let twin = CompiledRequest {
-                prefix: cev_core::compile::content_free_prefix(fmt),
-                questions: missing.iter().map(|&i| main.questions[i].clone()).collect(),
-            };
+            let mut twin = content_free(&main);
+            twin.questions = missing.iter().map(|&i| main.questions[i].clone()).collect();
             let mut outs = self.backend.run_many(&[main.clone(), twin])?;
             let twin_out = outs.pop().expect("twin output");
             let mut cache = self.calibration.lock();
             for (&i, r) in missing.iter().zip(twin_out.readouts) {
-                cache.put(main.questions[i].suffix.clone(), r.logits.clone());
+                cache.put(keys[i].clone(), r.logits.clone());
                 cf[i] = Some(r.logits);
             }
             outs.pop().expect("main output")
@@ -301,14 +315,11 @@ impl Cev {
                         score[opt] += (lp[pos] - base.as_ref().map_or(0.0, |b| b[pos])) / n;
                     }
                 }
-                Readout { logits: score.into_iter().map(|v| v as f32).collect(), hidden: out.readouts[span.start].hidden.clone() }
+                let base = &out.readouts[span.start];
+                Readout { logits: score.into_iter().map(|v| v as f32).collect(), hidden: base.hidden.clone(), suffix: base.suffix.clone(), codes: base.codes.clone() }
             })
             .collect();
-        Ok(BackendOutput {
-            readouts,
-            input_tokens: out.input_tokens,
-            prefix_cached: out.prefix_cached,
-        })
+        Ok(BackendOutput { readouts, input_tokens: out.input_tokens, prefix_cached: out.prefix_cached, prefix: out.prefix })
     }
 
     /// Record feedback on a stored decision and (optionally) learn from it.
@@ -400,6 +411,8 @@ impl Cev {
                 no_store: false,
                 debias: None,
                 namespace: ex.namespace.clone(),
+                images: ex.images.clone(),
+                audio: ex.audio.clone(),
             })?;
             let mut fbs = Vec::new();
             for (qid, label) in &ex.labels {

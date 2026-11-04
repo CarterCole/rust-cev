@@ -6,7 +6,8 @@ use crate::qwen3::{Config, LayerKv, PrefixKv, Qwen3, Tensors};
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use cev_core::{Backend, BackendOutput, CompiledRequest, PromptFormat, Readout};
+use cev_core::prompt::cev as prompt;
+use cev_core::{Backend, BackendOutput, Capabilities, CompiledRequest, Debias, Family, PromptFormat, Readout};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,19 +84,20 @@ fn pick_device(s: &str) -> Result<Device> {
 impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(opts: EngineOptions) -> Result<Self> {
-        let files = hub::resolve(&opts.model)?;
-        let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(anyhow::Error::msg)?;
+        let files = hub::backbone(&hub::alias(&opts.model))?;
+        let weights = files.weights()?;
+        let tokenizer = Tokenizer::from_file(files.path("tokenizer.json")).map_err(anyhow::Error::msg)?;
         let tc = ["tokenizer_config.json", "chat_template.jinja"]
             .iter()
             .map(|f| std::fs::read_to_string(files.dir.join(f)).unwrap_or_default())
             .collect::<String>();
-        let config = std::fs::read(&files.config)?;
-        let names = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files.weights)? };
+        let config = files.read("config.json")?;
+        let names = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&weights)? };
         if names.tensors().iter().any(|(name, _)| name == QUANT_MARKER) {
             // int8 checkpoint (examples/quantize.rs): CPU only.
             tracing::info!(dir = %files.dir.display(), "loading int8 weights (cpu)");
             let mut tensors = Tensors::new();
-            for w in &files.weights {
+            for w in &weights {
                 tensors.extend(candle_core::safetensors::load(w, &Device::Cpu)?);
             }
             let vb = VarBuilder::from_tensors(tensors.clone(), DType::F32, &Device::Cpu);
@@ -104,7 +106,7 @@ impl Engine {
         let device = pick_device(&opts.device)?;
         // f32 is exact (matches transformers) and on Metal costs little for
         // small models; bigger checkpoints default to bf16 to halve memory.
-        let weight_bytes: u64 = files.weights.iter().filter_map(|w| std::fs::metadata(w).ok()).map(|m| m.len()).sum();
+        let weight_bytes: u64 = weights.iter().filter_map(|w| std::fs::metadata(w).ok()).map(|m| m.len()).sum();
         let dtype = match opts.dtype.as_str() {
             "auto" if device.is_cuda() => DType::BF16,
             "auto" if device.is_metal() && weight_bytes > 4 << 30 => DType::BF16,
@@ -114,7 +116,7 @@ impl Engine {
             other => bail!("unknown dtype `{other}`"),
         };
         tracing::info!(dir = %files.dir.display(), ?device, ?dtype, "loading weights");
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, &device)? };
         let engine = Self::build(&config, tokenizer, &tc, vb, None, opts)?;
         engine.warmup()?;
         Ok(engine)
@@ -172,7 +174,7 @@ impl Engine {
             "state": "warmup",
             "questions": {"a": {"type": "noul", "instructions": "ok?"}, "b": {"type": "score", "instructions": "level?", "criteria": ["a", "b", "c"]}}
         }))?;
-        self.run(&cev_core::compile(&req, &self.codes, &self.format)?)?;
+        self.run(&cev_core::compile(&req, self.codes.len())?)?;
         self.cache.lock().entries.clear();
         tracing::info!(ms = t.elapsed().as_millis() as u64, "warmed up");
         Ok(())
@@ -185,23 +187,14 @@ impl Engine {
 
 /// Codes the model answers with: A..Z, then two-letter codes, keeping only
 /// those that are one token and tokenize identically after the answer prompt.
-fn code_vocab(tok: &Tokenizer, fmt: &PromptFormat) -> Result<(Vec<String>, Vec<u32>)> {
+pub fn code_vocab(tok: &Tokenizer, fmt: &PromptFormat) -> Result<(Vec<String>, Vec<u32>)> {
     let enc = |s: &str| -> Result<Vec<u32>> {
         Ok(tok.encode(s, false).map_err(anyhow::Error::msg)?.get_ids().to_vec())
     };
-    let probe = cev_core::compile(
-        &serde_json::from_value(serde_json::json!({
-            "state": "x", "questions": {"q": {"type": "noul", "instructions": "x"}}
-        }))?,
-        &["A".into(), "B".into()],
-        fmt,
-    )?
-    .full_prompt(0);
+    let probe = fmt.probe();
     let base = enc(&probe)?;
-    let letters = (b'A'..=b'Z').map(|c| (c as char).to_string());
-    let pairs = (b'A'..=b'Z').flat_map(|a| (b'A'..=b'Z').map(move |b| format!("{}{}", a as char, b as char)));
     let (mut codes, mut ids) = (Vec::new(), Vec::new());
-    for code in letters.chain(pairs) {
+    for code in prompt::candidate_codes() {
         if codes.len() == cev_core::compile::MAX_OPTIONS {
             break;
         }
@@ -235,11 +228,8 @@ impl Backend for Engine {
     fn hidden_size(&self) -> usize {
         self.model.cfg.hidden_size
     }
-    fn codes(&self) -> &[String] {
-        &self.codes
-    }
-    fn format(&self) -> &PromptFormat {
-        &self.format
+    fn capabilities(&self) -> Capabilities {
+        Capabilities { family: Family::Cev, images: false, audio: false, max_options: self.codes.len(), debias: Debias::Full }
     }
 
     fn run(&self, req: &CompiledRequest) -> Result<BackendOutput> {
@@ -309,6 +299,7 @@ impl Backend for Engine {
                 readouts: r.into_iter().map(|x| x.expect("every question answered")).collect(),
                 input_tokens: p.prefix.len() + p.suffixes.iter().map(Vec::len).sum::<usize>(),
                 prefix_cached: p.cached.is_some(),
+                prefix: p.prefix_text,
             })
             .collect())
     }
@@ -318,6 +309,9 @@ impl Backend for Engine {
 struct Plan {
     prefix: Vec<u32>,
     suffixes: Vec<Vec<u32>>,
+    /// Prompt text: the shared prefix and each question's suffix.
+    prefix_text: String,
+    suffix_text: Vec<String>,
     n_options: Vec<usize>,
     /// Cache hit for the whole prefix.
     cached: Option<Arc<PrefixKv>>,
@@ -330,11 +324,16 @@ struct Plan {
 
 impl Engine {
     fn plan(&self, req: &CompiledRequest) -> Result<Plan> {
+        if !req.media.is_empty() {
+            bail!("this backbone takes text only");
+        }
+        let prefix_text = self.format.request_prefix(req);
+        let suffix_text: Vec<String> = req.questions.iter().map(|q| self.format.question_suffix(q, &self.codes)).collect();
         // Tokenize every full prompt independently, then split at the longest
         // token prefix shared with the prefix text, so BPE merges across the
         // boundary can never change what the model sees.
-        let prefix_ids = self.encode(&req.prefix)?;
-        let fulls: Vec<Vec<u32>> = (0..req.questions.len()).map(|i| self.encode(&req.full_prompt(i))).collect::<Result<_>>()?;
+        let prefix_ids = self.encode(&prefix_text)?;
+        let fulls: Vec<Vec<u32>> = suffix_text.iter().map(|s| self.encode(&format!("{prefix_text}{s}"))).collect::<Result<_>>()?;
         let split = fulls.iter().map(|f| lcp(&prefix_ids, f)).min().unwrap_or(0).min(prefix_ids.len());
         let split = split.min(fulls.iter().map(|f| f.len() - 1).min().unwrap_or(0));
         if split == 0 {
@@ -348,6 +347,8 @@ impl Engine {
         let cached = self.cache.lock().get(&prefix);
         Ok(Plan {
             suffixes: fulls.iter().map(|f| f[split..].to_vec()).collect(),
+            prefix_text,
+            suffix_text,
             n_options: req.questions.iter().map(|q| q.options.len()).collect(),
             past: cached.clone(),
             tail: prefix.len()..prefix.len(),
@@ -459,7 +460,7 @@ impl Engine {
         let logits: Vec<Vec<f32>> = logits.to_vec2()?;
         for ((&(pi, qi), h), z) in batch.iter().zip(hidden).zip(logits) {
             let k = plans[pi].n_options[qi];
-            readouts[pi][qi] = Some(Readout { logits: z[..k].to_vec(), hidden: h });
+            readouts[pi][qi] = Some(Readout { logits: z[..k].to_vec(), hidden: h, suffix: plans[pi].suffix_text[qi].clone(), codes: self.codes[..k].to_vec() });
         }
         Ok(())
     }

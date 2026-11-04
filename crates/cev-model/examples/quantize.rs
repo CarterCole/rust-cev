@@ -15,10 +15,11 @@ fn main() -> anyhow::Result<()> {
         [model, out] => (model, Path::new(out)),
         _ => anyhow::bail!("usage: quantize <model dir or repo id> <output dir>"),
     };
-    let files = cev_model::hub::resolve(model)?;
+    let files = cev_model::hub::backbone(&cev_model::hub::alias(model))?;
+    let weights = files.weights()?;
     std::fs::create_dir_all(out)?;
     let mut tensors = HashMap::new();
-    for w in &files.weights {
+    for w in &weights {
         for (name, t) in candle_core::safetensors::load(w, &Device::Cpu)? {
             if name.ends_with(".weight") && t.rank() == 2 {
                 let (q, scale) = quantize(&t)?;

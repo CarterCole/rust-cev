@@ -24,6 +24,15 @@ pub struct SystemOneRequest {
     /// change answers served in that namespace. Omit for the default bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Images every question sees, before the state: base64 PNG/JPEG/WebP/GIF,
+    /// with or without a `data:image/...;base64,` header (the same field as
+    /// Ollama's). Needs a backend with image support (d1, d1-omni, d3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    /// One audio clip every question hears: base64 WAV (16 kHz mono is best;
+    /// other rates are resampled). Needs a backend with audio support (d1-omni).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -184,6 +193,10 @@ pub struct Example {
     pub labels: IndexMap<String, Label>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -191,6 +204,10 @@ pub struct ModelInfo {
     pub id: String,
     pub object: &'static str,
     pub backbone: String,
+    /// Decision-model family: `cev`, `nimble`, `kev`, `d3`, `d1` or `d1-omni`.
+    pub family: String,
+    /// `text`, plus `image` and/or `audio` when the backend takes them.
+    pub modalities: Vec<String>,
     pub hidden_size: usize,
     pub max_options: usize,
     pub prompt_version: String,
