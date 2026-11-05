@@ -26,6 +26,12 @@ pub struct StreamLoader {
     pos: usize,
     received: usize,
     tensors: HashMap<String, Tensor>,
+    /// Name prefixes of tensors to drop as they stream past.
+    skip: Vec<String>,
+    /// Name suffixes of tensors kept in the file's dtype.
+    keep: Vec<String>,
+    /// Bytes of the tensor being skipped seen so far.
+    skipped: usize,
 }
 
 fn dtype_of(s: &str) -> Result<DType> {
@@ -44,7 +50,21 @@ fn dtype_of(s: &str) -> Result<DType> {
 impl StreamLoader {
     /// Float tensors are converted to `dtype` (CPU).
     pub fn new(dtype: DType) -> Self {
-        Self { dtype, entries: None, next: 0, buf: Vec::new(), pos: 0, received: 0, tensors: HashMap::new() }
+        Self { dtype, entries: None, next: 0, buf: Vec::new(), pos: 0, received: 0, tensors: HashMap::new(), skip: Vec::new(), keep: Vec::new(), skipped: 0 }
+    }
+
+    /// Drop tensors whose name starts with `prefix` (towers a backend does
+    /// not use), without ever holding their bytes.
+    pub fn skip(mut self, prefix: &str) -> Self {
+        self.skip.push(prefix.into());
+        self
+    }
+
+    /// Keep tensors whose name ends with `suffix` in the file's dtype (a
+    /// bf16 embedding table read one row at a time costs half the memory).
+    pub fn keep_dtype(mut self, suffix: &str) -> Self {
+        self.keep.push(suffix.into());
+        self
     }
 
     /// Bytes pushed so far.
@@ -104,6 +124,18 @@ impl StreamLoader {
                 }
             }
             let size = e.end - e.start;
+            if self.skip.iter().any(|p| e.name.starts_with(p.as_str())) {
+                let take = (size - self.skipped).min(chunk.len());
+                chunk = &chunk[take..];
+                self.pos += take;
+                self.skipped += take;
+                if self.skipped < size {
+                    break;
+                }
+                self.skipped = 0;
+                self.next += 1;
+                continue;
+            }
             if self.buf.is_empty() {
                 self.buf.reserve_exact(size);
             }
@@ -116,7 +148,8 @@ impl StreamLoader {
             }
             let t = Tensor::from_raw_buffer(&self.buf, e.dtype, &e.shape, &Device::Cpu)?;
             self.buf = Vec::new();
-            let t = if e.dtype.is_float() { t.to_dtype(self.dtype)? } else { t };
+            let keep = self.keep.iter().any(|k| e.name.ends_with(k.as_str()));
+            let t = if e.dtype.is_float() && !keep { t.to_dtype(self.dtype)? } else { t };
             self.tensors.insert(e.name.clone(), t);
             self.next += 1;
         }
@@ -157,6 +190,15 @@ mod tests {
             let t = l.finish().unwrap();
             assert_eq!(t["a"].to_vec2::<f32>().unwrap(), vec![vec![0.0, 1.0, 2.0], vec![3.0, 4.0, 5.0]]);
             assert_eq!(t["b"].to_vec1::<f32>().unwrap(), vec![1.5, -2.0]);
+        }
+        for chunk in [1, 5, file.len()] {
+            let mut l = StreamLoader::new(DType::F32).skip("a").keep_dtype("b");
+            for c in file.chunks(chunk) {
+                l.push(c).unwrap();
+            }
+            let t = l.finish().unwrap();
+            assert!(!t.contains_key("a"));
+            assert_eq!(t["b"].dtype(), DType::BF16);
         }
         let mut l = StreamLoader::new(DType::F32);
         l.push(&file[..file.len() - 1]).unwrap();

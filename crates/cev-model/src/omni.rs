@@ -8,13 +8,16 @@
 
 use crate::audio::{AudioConfig, AudioEncoder};
 use crate::engine::EngineOptions;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::hub::RepoFiles;
 use crate::decoder::Decoder;
 use crate::lfm2::{self, Lfm2};
 use crate::media::{self, LfmTileParams};
 use crate::siglip2::{Projector, Siglip2, VisionConfig as SiglipConfig};
 use anyhow::{Context, Result, bail};
-use candle_core::{D, DType, Device, Module, Tensor};
+#[cfg(not(target_arch = "wasm32"))]
+use candle_core::Device;
+use candle_core::{D, DType, Module, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, linear};
 use cev_core::prompt::omni::{self as prompt, Mode, Parts};
 use cev_core::{Backend, BackendOutput, Capabilities, CompiledQuestion, CompiledRequest, Debias, Family, QuestionType, Readout};
@@ -192,8 +195,8 @@ struct Row {
 }
 
 impl OmniEngine {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(files: &RepoFiles, opts: EngineOptions, device: &Device) -> Result<Self> {
-        let cfg: OmniConfig = serde_json::from_slice(&files.read("config.json")?).context("d1-omni config.json")?;
         let tokenizer = Tokenizer::from_file(files.path("tokenizer.json")).map_err(anyhow::Error::msg)?;
         let weights = files.weights()?;
         let dtype = crate::load::pick_dtype(&opts.dtype, device, 0)?;
@@ -203,6 +206,14 @@ impl OmniEngine {
             st.get("encoder.layers.0.feed_forward.w1.weight").map(|t| t.shape()[0]).unwrap_or(0)
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, device)? };
+        Self::from_parts(&files.read("config.json")?, tokenizer, vb, w1_rows, files.repo.clone(), opts)
+    }
+
+    /// From `config.json`, the tokenizer and a `VarBuilder` over the weights
+    /// (`w1_rows`: rows of the first feed-forward `w1`, to detect the
+    /// adjusted FFN width).
+    pub fn from_parts(config: &[u8], tokenizer: Tokenizer, vb: VarBuilder, w1_rows: usize, repo: String, opts: EngineOptions) -> Result<Self> {
+        let cfg: OmniConfig = serde_json::from_slice(config).context("d1-omni config.json")?;
         let adjust = lfm2::ffn_adjust_from_shape(&cfg.text_config, w1_rows) || cfg.text_config.block_auto_adjust_ff_dim;
         let d = cfg.text_config.hidden_size;
         let trunk = Lfm2::new(cfg.text_config.clone(), vb.pp("encoder"), cfg.max_length, adjust)?;
@@ -212,7 +223,7 @@ impl OmniEngine {
         let audio = AudioEncoder::new(cfg.audio_config.clone(), d, vb.pp("audio"))?;
         let id = |t: &str| tokenizer.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
         let ids = Ids { bos: cfg.bos_token_id, state: id(prompt::STATE)?, question: id(prompt::QUESTION)?, option: id(prompt::OPTION)?, option_end: id(prompt::OPTION_END)?, decide: id(prompt::DECIDE)?, marker: id(prompt::MARKER)? };
-        let name = opts.name.clone().unwrap_or_else(|| format!("cev-{}", files.repo.rsplit('/').next().unwrap_or("d1-omni").to_lowercase()));
+        let name = opts.name.clone().unwrap_or_else(|| format!("cev-{}", repo.rsplit('/').next().unwrap_or("d1-omni").to_lowercase()));
         Ok(Self {
             trunk,
             head,
@@ -223,7 +234,7 @@ impl OmniEngine {
             ids,
             cfg,
             name,
-            backbone: files.repo.clone(),
+            backbone: repo,
             opts,
             tiles: LfmTileParams { bicubic: false, ..LfmTileParams::default() },
         })

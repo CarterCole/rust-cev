@@ -1,6 +1,6 @@
 // Runs cev (wasm) off the main thread. Messages: {id, op, args} in,
 // {id, result | error} out, plus {progress} while a model loads.
-import init, { Cev, WeightLoader } from './pkg/cev_wasm.js';
+import init, { Cev, ModelFiles, WeightLoader } from './pkg/cev_wasm.js';
 
 let cev = null;
 const ready = init().then(() => {
@@ -8,6 +8,45 @@ const ready = init().then(() => {
 });
 
 const progress = (text, done = 0, total = 0) => postMessage({ progress: { text, done, total } });
+
+// What each model needs, repository by repository. `weights` is streamed
+// into wasm memory tensor by tensor; the other files are read whole. Each
+// repository is looked for in web/models/<repo name>/ first (a symlink to a
+// Hugging Face snapshot directory works), then fetched from huggingface.co
+// at the pinned revision.
+const MODELS = {
+  'qwen3-0.6b': {
+    kind: 'qwen3',
+    repo: 'Qwen/Qwen3-0.6B',
+    parts: [{ repo: 'Qwen/Qwen3-0.6B', files: ['config.json', 'tokenizer.json'], optional: ['tokenizer_config.json'], weights: 'model.safetensors' }],
+  },
+  // The int8 copy made by `cev-model`'s quantize example; local only.
+  'qwen3-0.6b-q8': {
+    kind: 'qwen3',
+    repo: 'Qwen/Qwen3-0.6B-q8',
+    localOnly: true,
+    parts: [{ repo: 'Qwen/Qwen3-0.6B-q8', files: ['config.json', 'tokenizer.json'], optional: ['tokenizer_config.json'], weights: 'model.safetensors' }],
+  },
+  // A LoRA adapter and pointer head over Qwen3.5-0.8B-Base, merged in wasm.
+  'kev-0.8b': {
+    kind: 'kev',
+    repo: 'jaredpalmer/kev-0.8b',
+    parts: [
+      { repo: 'jaredpalmer/kev-0.8b', rev: 'bf75a6a8848ea6960ff2ed108d9ed44c2941174f', files: ['adapter_config.json', 'adapter_model.safetensors', 'head.pt'] },
+      {
+        repo: 'Qwen/Qwen3.5-0.8B-Base',
+        rev: 'dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68',
+        files: ['config.json', 'tokenizer.json'],
+        weights: 'model.safetensors-00001-of-00001.safetensors',
+      },
+    ],
+  },
+  'd1-omni-600m': {
+    kind: 'd1-omni',
+    repo: 'LiquidAI/d1-omni-600M',
+    parts: [{ repo: 'LiquidAI/d1-omni-600M', rev: '02b55d7076f15129e59ab3f94783f32c4b088674', files: ['config.json', 'tokenizer.json'], weights: 'model.safetensors' }],
+  },
+};
 
 // Files from huggingface.co are kept in Cache Storage, so a reload does not
 // download them again. Local files (web/models/) are just fetched.
@@ -22,52 +61,69 @@ async function get(url, cache) {
   return new Response(a, { headers: resp.headers });
 }
 
-const isLocal = (name) => fetch(`models/${name}/config.json`, { method: 'HEAD' }).then((r) => r.ok, () => false);
+const dirName = (repo) => repo.split('/').pop();
+const isLocal = (repo, file = 'config.json') =>
+  fetch(`models/${dirName(repo)}/${file}`, { method: 'HEAD' }).then((r) => r.ok, () => false);
 
-// `variant` "q8" loads the int8 copy made by `cev-model`'s quantize example,
-// which only exists locally (web/models/<name>-q8/).
-async function load(repo, variant) {
-  if (variant) repo = `${repo}-${variant}`;
-  const name = repo.split('/').pop();
-  let base = `models/${name}`;
-  let cache = null;
-  const local = await isLocal(name);
-  if (!local && variant) throw new Error(`web/models/${name}/ not found`);
-  if (!local) {
-    base = `https://huggingface.co/${repo}/resolve/main`;
-    cache = await caches.open('cev-models').catch(() => null);
+// Where one repository's files come from.
+async function source(part, localOnly) {
+  const first = part.files[0];
+  if (await isLocal(part.repo, first)) return { base: `models/${dirName(part.repo)}`, cache: null };
+  if (localOnly) throw new Error(`web/models/${dirName(part.repo)}/ not found`);
+  const cache = await caches.open('cev-models').catch(() => null);
+  return { base: `https://huggingface.co/${part.repo}/resolve/${part.rev ?? 'main'}`, cache };
+}
+
+async function load(key) {
+  const spec = MODELS[key];
+  if (!spec) throw new Error(`unknown model ${key}`);
+  const files = new ModelFiles();
+  const streams = [];
+  try {
+    for (const part of spec.parts) {
+      const { base, cache } = await source(part, spec.localOnly);
+      for (const file of [...part.files, ...(part.optional ?? [])]) {
+        progress(`Fetching ${file}…`);
+        let resp;
+        try {
+          resp = await get(`${base}/${file}`, cache);
+        } catch (e) {
+          if (part.files.includes(file)) throw e;
+          continue;
+        }
+        files.add(file, new Uint8Array(await resp.arrayBuffer()));
+      }
+      if (part.weights) streams.push(await get(`${base}/${part.weights}`, cache));
+    }
+  } catch (e) {
+    files.free();
+    throw e;
   }
-  progress('Fetching tokenizer…');
-  const bytes = async (file) => new Uint8Array(await (await get(`${base}/${file}`, cache)).arrayBuffer());
-  const config = await bytes('config.json');
-  const tokenizer = await bytes('tokenizer.json');
-  const tokenizerConfig = await get(`${base}/tokenizer_config.json`, cache).then((r) => r.text(), () => '');
-
-  const resp = await get(`${base}/model.safetensors`, cache);
-  const total = Number(resp.headers.get('content-length')) || 0;
+  const total = streams.reduce((n, r) => n + (Number(r.headers.get('content-length')) || 0), 0);
   // Two models do not fit in wasm memory: drop the current one first.
   cev.free();
   cev = Cev.mock();
-  const loader = new WeightLoader();
-  const reader = resp.body.getReader();
+  const loader = WeightLoader.for_model(spec.kind);
   let done = 0;
   let shown = 0;
   try {
-    for (;;) {
-      const { value, done: end } = await reader.read();
-      if (end) break;
-      loader.push(value);
-      done += value.length;
-      if (done - shown > 8 << 20) {
-        progress('Loading weights', (shown = done), total);
+    for (const resp of streams) {
+      const reader = resp.body.getReader();
+      for (;;) {
+        const { value, done: end } = await reader.read();
+        if (end) break;
+        loader.push(value);
+        done += value.length;
+        if (done - shown > 8 << 20) progress('Loading weights', (shown = done), total);
       }
     }
   } catch (e) {
     loader.free();
+    files.free();
     throw e;
   }
   progress('Building model…', done, total);
-  const next = Cev.load(repo, config, tokenizer, tokenizerConfig, loader);
+  const next = Cev.load_files(spec.repo, files, loader);
   cev.free();
   cev = next;
   return JSON.parse(cev.model());
@@ -75,7 +131,11 @@ async function load(repo, variant) {
 
 const ops = {
   load,
-  has_local: isLocal,
+  // Models whose files are all in web/models/ (the int8 copy is offered only then).
+  has_local: async (key) => {
+    for (const p of MODELS[key].parts) if (!(await isLocal(p.repo, p.files[0]))) return false;
+    return true;
+  },
   model: () => JSON.parse(cev.model()),
   decide: (req) => JSON.parse(cev.decide(JSON.stringify(req))),
   feedback: (req) => JSON.parse(cev.feedback(JSON.stringify(req))),

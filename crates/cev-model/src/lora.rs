@@ -49,6 +49,18 @@ impl Adapter {
         let cfg = AdapterConfig::load(dir)?;
         let file = dir.join("adapter_model.safetensors");
         let tensors = candle_core::safetensors::load(&file, dev).with_context(|| format!("{}", file.display()))?;
+        Self::from_tensors(cfg, tensors)
+    }
+
+    /// From the bytes of `adapter_config.json` and `adapter_model.safetensors`
+    /// (on the CPU).
+    pub fn from_bytes(config: &[u8], weights: &[u8]) -> Result<Self> {
+        let cfg: AdapterConfig = serde_json::from_slice(config).context("adapter_config.json")?;
+        let tensors = candle_core::safetensors::load_buffer(weights, &Device::Cpu).context("adapter_model.safetensors")?;
+        Self::from_tensors(cfg, tensors)
+    }
+
+    fn from_tensors(cfg: AdapterConfig, tensors: HashMap<String, Tensor>) -> Result<Self> {
         let mut deltas: HashMap<String, (Option<Tensor>, Option<Tensor>)> = HashMap::new();
         for (name, t) in tensors {
             let (stem, is_a) = if let Some(s) = name.strip_suffix(".lora_A.weight") {
@@ -98,29 +110,66 @@ impl Adapter {
 /// result is moved to `dev`: exact, and independent of the accelerator (on
 /// Metal, merging a 9B model's matrices in place came out as zeros).
 /// `adapter` must be loaded on the CPU.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn merged_tensors(shards: &[std::path::PathBuf], dtype: DType, dev: &Device, adapter: &Adapter, root: &str) -> Result<HashMap<String, Tensor>> {
     let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(shards)? };
     let mut out = HashMap::new();
-    let mut merged = std::collections::HashSet::new();
-    let prefix = format!("{root}.");
+    let mut merger = Merger::new(adapter, root);
     for (name, _) in st.tensors() {
-        let t = st.load(&name, &Device::Cpu)?;
-        let module = name.strip_prefix(&prefix).and_then(|n| n.strip_suffix(".weight")).and_then(strip_to_layers);
-        let t = match module {
-            Some(m) if adapter.deltas.contains_key(m) => {
-                merged.insert(m.to_string());
-                // f32 base + f32 delta, rounded once to the serving dtype.
-                adapter.merge(m, &t.to_dtype(DType::F32)?)?
-            }
-            _ => t,
-        };
+        let t = merger.apply(&name, st.load(&name, &Device::Cpu)?)?;
         let t = if t.dtype().is_float() { t.to_dtype(dtype)? } else { t };
         out.insert(name, t.to_device(dev)?);
     }
-    if merged.len() != adapter.deltas.len() {
-        let missing: Vec<&str> = adapter.targets().filter(|m| !merged.contains(*m)).collect();
-        bail!("{} adapter matrices found no weight to merge into under `{root}`: {:?}", missing.len(), &missing[..missing.len().min(5)]);
-    }
-    tracing::info!(merged = merged.len(), scale = adapter.cfg.scale(), "merged LoRA adapter");
+    merger.finish()?;
     Ok(out)
+}
+
+/// Merge `adapter` into CPU tensors already in memory (the browser's
+/// streamed weights), one matrix at a time, keeping each tensor's dtype.
+pub fn merge_in_place(tensors: &mut HashMap<String, Tensor>, adapter: &Adapter, root: &str) -> Result<()> {
+    let mut merger = Merger::new(adapter, root);
+    let names: Vec<String> = tensors.keys().cloned().collect();
+    for name in names {
+        let t = tensors.remove(&name).expect("listed");
+        let dtype = t.dtype();
+        let t = merger.apply(&name, t)?;
+        tensors.insert(name, if t.dtype() != dtype { t.to_dtype(dtype)? } else { t });
+    }
+    merger.finish()
+}
+
+/// Tracks which adapter matrices found their weight.
+struct Merger<'a> {
+    adapter: &'a Adapter,
+    prefix: String,
+    merged: std::collections::HashSet<String>,
+}
+
+impl<'a> Merger<'a> {
+    fn new(adapter: &'a Adapter, root: &str) -> Self {
+        Self { adapter, prefix: format!("{root}."), merged: Default::default() }
+    }
+
+    /// `t` with the adapter's delta added if it targets `name` (f32 base +
+    /// f32 delta: rounded once by the caller to the serving dtype).
+    fn apply(&mut self, name: &str, t: Tensor) -> Result<Tensor> {
+        let module = name.strip_prefix(&self.prefix).and_then(|n| n.strip_suffix(".weight")).and_then(strip_to_layers);
+        match module {
+            Some(m) if self.adapter.deltas.contains_key(m) => {
+                self.merged.insert(m.to_string());
+                self.adapter.merge(m, &t.to_dtype(DType::F32)?)
+            }
+            _ => Ok(t),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        let (adapter, merged) = (self.adapter, self.merged);
+        if merged.len() != adapter.deltas.len() {
+            let missing: Vec<&str> = adapter.targets().filter(|m| !merged.contains(*m)).collect();
+            bail!("{} adapter matrices found no weight to merge into under `{}`: {:?}", missing.len(), self.prefix.trim_end_matches('.'), &missing[..missing.len().min(5)]);
+        }
+        tracing::info!(merged = merged.len(), scale = adapter.cfg.scale(), "merged LoRA adapter");
+        Ok(())
+    }
 }

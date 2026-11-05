@@ -10,7 +10,12 @@
 //! | `adapter_config.json` + `schema_config.json` | Nimble (LoRA on Qwen3.5, merged at load) |
 //! | `adapter_config.json` + `head.pt` | Kev (LoRA on Qwen3.5-Base, merged at load, plus the pointer head) |
 
+// The browser build has only the in-memory half of this module.
+#![cfg_attr(target_arch = "wasm32", allow(unused_imports, dead_code))]
+
+use crate::decoder::Decoder;
 use crate::engine::{Engine, EngineOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::hub::{self, RepoFiles, WEIGHTS};
 use crate::hybrid::{HybridEngine, Kind, PointerHead};
 use crate::lora::Adapter;
@@ -60,10 +65,12 @@ pub fn pick_dtype(s: &str, device: &Device, weight_bytes: u64) -> Result<DType> 
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn weight_bytes(paths: &[std::path::PathBuf]) -> u64 {
     paths.iter().filter_map(|w| std::fs::metadata(w).ok()).map(|m| m.len()).sum()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// `cev-<repo name>` unless the caller named the model.
 fn backend_name(opts: &EngineOptions, files: &RepoFiles) -> String {
     opts.name.clone().unwrap_or_else(|| format!("cev-{}", short_name(&files.repo)))
@@ -73,6 +80,7 @@ fn short_name(model: &str) -> String {
     model.trim_end_matches('/').rsplit('/').next().unwrap_or("model").split('@').next().unwrap_or("model").to_lowercase()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// What a repository turned out to be.
 #[derive(Debug)]
 pub enum Detected {
@@ -114,6 +122,7 @@ fn one() -> f32 {
     1.0
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Resolve `model` (alias, repo id or directory) and work out its family.
 pub fn detect(model: &str) -> Result<Detected> {
     let model = hub::alias(model);
@@ -160,18 +169,30 @@ pub struct KevMeta {
     pub head_dim: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Read the scalar fields of `head.pt` (a torch pickle inside a zip).
 pub fn kev_meta(path: &std::path::Path) -> Result<KevMeta> {
+    let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
+    Ok(kev_head(&bytes)?.0)
+}
+
+/// Kev's `head.pt` from its bytes: the scalar fields and the pointer head's
+/// tensors by name (`q.weight`, ...), on the CPU.
+pub fn kev_head(bytes: &[u8]) -> Result<(KevMeta, HashMap<String, Tensor>)> {
     use candle_core::pickle::{Object, Stack};
-    let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
-    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("head.pt is not a torch zip")?;
     let names: Vec<String> = zip.file_names().map(String::from).collect();
     let pkl = names.iter().find(|n| n.ends_with("data.pkl")).context("head.pt: no data.pkl")?;
-    let mut reader = std::io::BufReader::new(zip.by_name(pkl)?);
-    let mut stack = Stack::empty();
-    stack.read_loop(&mut reader)?;
-    let obj = stack.finalize()?;
+    let dir = std::path::PathBuf::from(pkl.strip_suffix(".pkl").expect("ends with .pkl"));
+    let obj = {
+        let mut reader = std::io::BufReader::new(zip.by_name(pkl)?);
+        let mut stack = Stack::empty();
+        stack.read_loop(&mut reader)?;
+        stack.finalize()?
+    };
     let mut meta = KevMeta { base_revision: None, temperature: 1.0, head_dim: 256 };
+    let mut infos = Vec::new();
     if let Object::Dict(kv) = obj {
         for (k, v) in kv {
             let Object::Unicode(k) = k else { continue };
@@ -180,11 +201,30 @@ pub fn kev_meta(path: &std::path::Path) -> Result<KevMeta> {
                 ("temperature", Object::Int(t)) => meta.temperature = t as f32,
                 ("head_dim", Object::Int(d)) => meta.head_dim = d as usize,
                 ("base_revision", Object::Unicode(r)) => meta.base_revision = Some(r),
+                ("head", Object::Dict(tensors)) => {
+                    for (name, t) in tensors {
+                        if let Some(info) = t.into_tensor_info(name, &dir)? {
+                            infos.push(info);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
     }
-    Ok(meta)
+    let mut head = HashMap::new();
+    for info in infos {
+        if !info.layout.is_contiguous() {
+            bail!("head.pt: `{}` is not stored contiguously", info.name);
+        }
+        let mut reader = zip.by_name(&info.path).with_context(|| format!("head.pt: no {}", info.path))?;
+        std::io::copy(&mut reader.by_ref().take(info.layout.start_offset() as u64), &mut std::io::sink())?;
+        let mut raw = vec![0u8; info.layout.shape().elem_count() * info.dtype.size_in_bytes()];
+        reader.read_exact(&mut raw).with_context(|| format!("head.pt: {} is truncated", info.path))?;
+        let t = Tensor::from_raw_buffer(&raw, info.dtype, info.layout.dims(), &Device::Cpu)?;
+        head.insert(info.name, t);
+    }
+    Ok((meta, head))
 }
 
 /// Where a Qwen3.5 checkpoint keeps its text model.
@@ -202,10 +242,12 @@ fn text_root(names: &[String]) -> Result<(&'static str, Option<&'static str>)> {
     Ok((root, has("lm_head.").then_some("lm_head")))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_tokenizer(files: &RepoFiles) -> Result<Tokenizer> {
     Tokenizer::from_file(files.path("tokenizer.json")).map_err(anyhow::Error::msg)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Build a Qwen3.5 decoder from `base` (optionally with a merged adapter),
 /// and its vision tower when the checkpoint has one.
 pub fn qwen35(base: &RepoFiles, adapter: Option<&Adapter>, opts: &EngineOptions, device: &Device) -> Result<(Qwen35, Qwen35Config, Option<Qwen35Vision>)> {
@@ -217,12 +259,19 @@ pub fn qwen35(base: &RepoFiles, adapter: Option<&Adapter>, opts: &EngineOptions,
         let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&weights)? };
         st.tensors().into_iter().map(|(n, _)| n).collect()
     };
-    let (root, head) = text_root(&names)?;
+    let (root, _) = text_root(&names)?;
     let vb = match adapter {
         Some(a) => VarBuilder::from_tensors(crate::lora::merged_tensors(&weights, dtype, device, a, root)?, dtype, device),
         None => unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, device)? },
     };
-    let model = Qwen35::new(text, vb.pp(root), head.map(|h| vb.pp(h)), opts.max_context)?;
+    qwen35_from(cfg, text, &names, vb, opts.max_context, dtype)
+}
+
+/// The decoder (and vision tower, if any) from a `VarBuilder` over a
+/// Qwen3.5 checkpoint whose tensor names are `names`.
+fn qwen35_from(cfg: Qwen35Config, text: crate::qwen35::TextConfig, names: &[String], vb: VarBuilder, max_context: usize, embed_dtype: DType) -> Result<(Qwen35, Qwen35Config, Option<Qwen35Vision>)> {
+    let (root, head) = text_root(names)?;
+    let model = Qwen35::with_embed_dtype(text, vb.pp(root), head.map(|h| vb.pp(h)), max_context, embed_dtype)?;
     let visual_root = ["model.visual", "visual"].into_iter().find(|r| names.iter().any(|n| n.starts_with(&format!("{r}.blocks."))));
     let vision = match (visual_root, &cfg.vision_config) {
         (Some(r), Some(vc)) => {
@@ -274,6 +323,7 @@ pub fn nimble_codes(tok: &Tokenizer) -> Vec<String> {
     codes
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Load any supported model as a backend.
 pub fn load(opts: EngineOptions) -> Result<Arc<dyn Backend>> {
     let detected = detect(&opts.model)?;
@@ -422,21 +472,90 @@ pub fn load(opts: EngineOptions) -> Result<Arc<dyn Backend>> {
         Detected::Kev { adapter, base } => {
             let tokenizer = load_tokenizer(&base)?;
             let lora = Adapter::load(&adapter.dir, &Device::Cpu)?;
-            let meta = kev_meta(&adapter.path("head.pt"))?;
+            let (meta, head) = kev_head(&adapter.read("head.pt")?)?;
             let (model, _cfg, _vision) = qwen35(&base, Some(&lora), &opts, &device)?;
-            let head: HashMap<String, Tensor> = candle_core::pickle::read_all_with_key(adapter.path("head.pt"), Some("head"))?.into_iter().collect();
-            let get = |n: &str| head.get(n).with_context(|| format!("head.pt has no `head.{n}`")).and_then(|t| Ok(t.to_device(&device)?.to_dtype(DType::F32)?));
-            let head = PointerHead { q_w: get("q.weight")?, q_b: get("q.bias")?, k_w: get("k.weight")?, k_b: get("k.bias")?, temperature: meta.temperature };
-            if head.q_w.dims() != [meta.head_dim, model.cfg.hidden_size] {
-                bail!("pointer head is {:?}, expected [{}, {}]", head.q_w.dims(), meta.head_dim, model.cfg.hidden_size);
-            }
-            let id = |t: &str| tokenizer.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
-            let kind = Kind::Pointer { head, decide_id: id(cev_core::prompt::kev::DECIDE)?, option_end_id: id(cev_core::prompt::kev::OPTION_END)? };
-            tracing::info!(temperature = meta.temperature, head_dim = meta.head_dim, "Kev pointer head");
             let id = name("kev", &adapter);
-            let engine = HybridEngine::new(Box::new(model), tokenizer, kind, id, adapter.repo.clone(), opts)?;
+            let engine = kev_engine(model, tokenizer, meta, head, id, adapter.repo.clone(), opts)?;
             engine.warmup()?;
             Ok(Arc::new(engine))
         }
+    }
+}
+
+/// Kev: the merged decoder plus the pointer head from `head.pt`.
+fn kev_engine(model: Qwen35, tokenizer: Tokenizer, meta: KevMeta, head: HashMap<String, Tensor>, id: String, repo: String, opts: EngineOptions) -> Result<HybridEngine> {
+    let device = model.device().clone();
+    let get = |n: &str| head.get(n).with_context(|| format!("head.pt has no `head.{n}`")).and_then(|t| Ok(t.to_device(&device)?.to_dtype(DType::F32)?));
+    let head = PointerHead { q_w: get("q.weight")?, q_b: get("q.bias")?, k_w: get("k.weight")?, k_b: get("k.bias")?, temperature: meta.temperature };
+    if head.q_w.dims() != [meta.head_dim, model.cfg.hidden_size] {
+        bail!("pointer head is {:?}, expected [{}, {}]", head.q_w.dims(), meta.head_dim, model.cfg.hidden_size);
+    }
+    let tid = |t: &str| tokenizer.token_to_id(t).with_context(|| format!("tokenizer has no {t}"));
+    let kind = Kind::Pointer { head, decide_id: tid(cev_core::prompt::kev::DECIDE)?, option_end_id: tid(cev_core::prompt::kev::OPTION_END)? };
+    tracing::info!(temperature = meta.temperature, head_dim = meta.head_dim, "Kev pointer head");
+    HybridEngine::new(Box::new(model), tokenizer, kind, id, repo, opts)
+}
+
+/// A model whose files are already in memory, as in the browser: small files
+/// by name, and the weights streamed in as CPU tensors.
+///
+/// | files | backend |
+/// |---|---|
+/// | `adapter_config.json`, `adapter_model.safetensors`, `head.pt` + the base's `config.json`, `tokenizer.json` | Kev (the LoRA is merged here) |
+/// | `config.json` with `model_type: d1_omni`, `tokenizer.json` | d1-omni |
+/// | `config.json` with `model_type: qwen3`, `tokenizer.json`, optional `tokenizer_config.json` | cev's readout on Qwen3 |
+///
+/// Runs on the CPU in f32 (tensors may hold other dtypes where the backend
+/// reads them that way: Qwen3.5's embedding table). No warmup: there are no
+/// kernels to compile.
+pub struct MemoryModel {
+    /// Repository the files came from (the adapter's, for Kev).
+    pub repo: String,
+    pub files: HashMap<String, Vec<u8>>,
+    pub tensors: HashMap<String, Tensor>,
+}
+
+/// The weight streamer for `kind` (`kev`, `d1-omni`, `qwen3`) in the
+/// browser: f32, minus what the backend never reads. Kev's base checkpoint
+/// carries a vision tower and a multi-token-prediction block it does not use,
+/// and its 248k-row embedding table stays bf16 (1 GB saved of a 4 GB address
+/// space).
+pub fn stream_loader(kind: &str) -> crate::weights::StreamLoader {
+    let l = crate::weights::StreamLoader::new(DType::F32);
+    match kind {
+        "kev" => l.skip("model.visual.").skip("mtp.").keep_dtype("embed_tokens.weight"),
+        _ => l,
+    }
+}
+
+pub fn from_memory(model: MemoryModel, opts: EngineOptions) -> Result<Arc<dyn Backend>> {
+    let MemoryModel { repo, files, mut tensors } = model;
+    let file = |n: &str| files.get(n).map(Vec::as_slice).with_context(|| format!("{repo}: {n} was not provided"));
+    let tokenizer = || Tokenizer::from_bytes(file("tokenizer.json")?).map_err(anyhow::Error::msg);
+    let id = opts.name.clone().unwrap_or_else(|| format!("cev-{}", short_name(&repo)));
+    if files.contains_key("head.pt") {
+        let lora = Adapter::from_bytes(file("adapter_config.json")?, file("adapter_model.safetensors")?)?;
+        let (meta, head) = kev_head(file("head.pt")?)?;
+        let (cfg, text) = Qwen35Config::parse(file("config.json")?)?;
+        let names: Vec<String> = tensors.keys().cloned().collect();
+        let (root, _) = text_root(&names)?;
+        let embed_dtype = tensors.get(&format!("{root}.embed_tokens.weight")).map_or(DType::F32, Tensor::dtype);
+        crate::lora::merge_in_place(&mut tensors, &lora, root)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let (model, _, _) = qwen35_from(cfg, text, &names, vb, opts.max_context, embed_dtype)?;
+        return Ok(Arc::new(kev_engine(model, tokenizer()?, meta, head, id, repo, opts)?));
+    }
+    let raw: serde_json::Value = serde_json::from_slice(file("config.json")?).context("config.json")?;
+    match raw["model_type"].as_str().unwrap_or_default() {
+        "d1_omni" => {
+            let w1_rows = tensors.get("encoder.layers.0.feed_forward.w1.weight").map_or(0, |t| t.dims()[0]);
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+            Ok(Arc::new(crate::omni::OmniEngine::from_parts(file("config.json")?, tokenizer()?, vb, w1_rows, repo, opts)?))
+        }
+        "qwen3" => {
+            let tc = files.get("tokenizer_config.json").map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+            Ok(Arc::new(Engine::from_parts(file("config.json")?, file("tokenizer.json")?, &tc, tensors, EngineOptions { name: Some(id), ..opts })?))
+        }
+        other => bail!("{repo}: model_type `{other}` cannot be loaded from memory (Kev, d1-omni and Qwen3 can)"),
     }
 }

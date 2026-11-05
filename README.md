@@ -178,7 +178,8 @@ Other flags:
 |---|---|---|
 | `--db` | `cev.db` | SQLite file for the decision log |
 | `--addr` | `127.0.0.1:8080` | Listen address |
-| `--api-key` | none | Require a bearer token |
+| `--api-key` | none | Require a bearer token on `/v1/*` and `/graphql` |
+| `--web` | none | Serve the browser page from this directory (`web/`) at `/`; the page sends no token, so it needs a server without `--api-key` |
 | `--no-online-learning` | off | Only store labels; don't adapt |
 | `--no-store-features` | off | Don't store hidden states |
 | `--min-examples` | 8 | Labels needed before an adapter can be served |
@@ -197,16 +198,44 @@ Latency on an M-series Mac, f32, 3 questions, end to end over HTTP (`scripts/ben
 
 ### In the browser
 
-`crates/cev-wasm` compiles the engine, the runtime and the online learner to WebAssembly, and `web/` is a static page around it: ask typed questions, click the right answer to send a label, and watch the adapter take over.
+`web/` is a page for trying cev by hand: pick a model, ask typed questions about text, an image or a voicemail, run them continuously over a microphone, camera, screen or media file, click the right answer to send a label, and watch the adapter take over. Decisions run in one of two places:
 
-```bash
-scripts/build_web.sh && python3 -m http.server -d web 8787    # then open http://localhost:8787
-```
+- **On a local cev server**, which serves the page itself. This is the fast one: the model runs natively on the GPU, and the page only captures, uploads and plays media.
 
-- The page starts on the mock backend. "Load Qwen3-0.6B" streams `model.safetensors` (1.5 GB) into the wasm module, converting each tensor to f32 as it arrives. Weights come from `web/models/Qwen3-0.6B/` if that exists (a symlink to a Hugging Face snapshot directory works), otherwise from huggingface.co, cached in the browser afterwards.
-- Answers are the same as the native CPU build.
-- f32 Qwen3-0.6B needs about 3 GB of the 4 GB a wasm32 module can address, so f32 is desktop-only and 0.6B-only.
+  ```bash
+  cargo run --release -p cev-server --features metal -- --model d1-omni --web web    # then open http://localhost:8080
+  ```
+
+- **In the tab**, with no server: `crates/cev-wasm` compiles the engines, the runtime and the online learner to WebAssembly, and nothing leaves the tab.
+
+  ```bash
+  scripts/build_web.sh && python3 -m http.server -d web 8787    # then open http://localhost:8787
+  ```
+
+The page shows "On the cev server" when a server serves it, and still offers "In this tab" (after `scripts/build_web.sh`). On the server the model is the one `--model` picked; in the tab it is one of these:
+
+| model | download | wasm memory | takes |
+|---|---:|---:|---|
+| Qwen3-0.6B (cev readout) | 1.5 GB | 2.9 GB | text |
+| Kev-0.8B | 1.6 GB | about 2.6 GB | text |
+| d1-omni-600M | 2.3 GB | about 2.5 GB | text, images, audio (WAV) |
+
+- The page starts on the mock backend. Loading a model streams its safetensors into the wasm module, converting each tensor to f32 as it arrives. Each repository's files come from `web/models/<repo name>/` if that exists (a symlink to a Hugging Face snapshot directory works: `Qwen3-0.6B`, `kev-0.8b` plus `Qwen3.5-0.8B-Base`, `d1-omni-600M`), otherwise from huggingface.co at a pinned revision, cached in the browser afterwards.
+- Kev's LoRA adapter is merged in the browser. Its base checkpoint's vision tower and multi-token-prediction block are skipped as they stream past, and the 248k-row embedding table stays bf16: that is what fits it in the 4 GB a wasm32 module can address. Larger models (d1-3B, d3, Nimble) do not fit.
+- "Screenshot check" and "Voicemail" attach the files in `web/examples/`; "Add image" and "Add WAV" attach your own. Media are sent as data URLs, as on the REST API.
+- Answers are the same as the native CPU build (`tests/memory_load.rs` checks the in-memory load path against loading from disk; in the page, the examples match the native server to the printed digit).
 - The decision log is in memory (SQLite is not built for wasm) and is gone on reload. "Export labels" downloads the same NDJSON as `/v1/export`.
+- It is slow: one thread, f32. On an M4 Max, Kev answers the 3-question ticket (107 tokens) in about 12 s, and d1-omni the screenshot (554 tokens) in about 47 s and the voicemail (459 tokens) in about 26 s, against about 1 s natively on the CPU.
+
+**Live.** The Live panel asks the request's questions over and over: every few seconds it sends the last few seconds of sound (as a WAV) or the current video frame (as a JPEG), one request at a time, skipping ticks that come while one is running. Sources are the microphone, a camera, a shared screen, or an audio or video file played in the page ("two voicemails" and "checkout screens" in `web/examples/`). Each question gets a strip of stacked bars, one per answer, so a change over time is visible. Ticks stay out of the decision log unless "keep in the decision log" is on (and only kept ticks can be labelled).
+
+| d1-omni-600M, M4 Max | per answer |
+|---|---:|
+| server (Metal), 5 s of sound | 0.9 s |
+| server (Metal), a frame | 0.17 s |
+| in the tab, a frame | 12 s |
+
+Microphones and cameras need a secure context: `localhost` counts, a LAN address does not. The server accepts request bodies up to 96 MB, enough for 64 MB of media.
 
 **int8.** `cev-model`'s `quantize` example writes an int8 copy of a checkpoint (per-row scales, inputs quantized to 13 bits at run time). It loads anywhere a model directory does (`cev --model <dir>`, CPU only), and the page offers it when it is in `web/models/`:
 
@@ -344,7 +373,7 @@ A full in-process example: `cargo run --release -p cev-rs --features local,metal
 | `cev-model` | candle backbones: Qwen3 (packed block-masked questions), Qwen3.5 (Gated DeltaNet + gated attention, vision tower), LFM2 / LFM2.5 (d1, d1-omni trunk), SigLIP2, FastConformer audio; the family readouts (codes, d3 matrix, Kev pointer head, d1 token groups, d1-omni decision head); LoRA merging; weight resolution and aliases |
 | `cev-runtime` | The decision service: SQLite log (in-memory on wasm), feedback, online adapters, export |
 | `cev-server` | `cev` binary: axum REST + async-graphql |
-| `cev-wasm`, `web/` | Browser demo: the same pipeline as a wasm module in a web worker, in-memory log |
+| `cev-wasm`, `web/` | Browser page: runs on the local server (`cev --web web`) or in the tab (the same pipeline as a wasm module in a web worker, in-memory log); live mic, camera, screen and file streams |
 | `cev-rs`, `cev-derive` | Typed SDK, imported as `cev` (`http` and `local` transports) and `#[derive(Choice)]` |
 | `training/` | PyTorch: `train_lora.py` (fine-tune from export), `parity.py` (check cev against transformers), `parity/dump_*.py` (reference answers for each decision model) |
 
@@ -353,6 +382,8 @@ Tests:
 - `cargo test --workspace --features cev-rs/local` runs everything against the mock backend, with no weights needed.
 - `training/parity.py` checks the real network against transformers.
 - `training/parity/dump_{qwen35,qwen35_vision,kev,d3,d1,omni_ref,nimble}.py` write reference answers (the 9B Nimble run needs about 40 GB of RAM); `CEV_PARITY_<NAME>=<file> cargo test --release -p cev-model --test parity_models --test parity_vision -- --nocapture` compares cev to them (`CEV_PARITY_DEVICE=metal`, `CEV_PARITY_DTYPE=bf16` for the accelerator paths).
+- `CEV_MEMORY_LOAD=1 cargo test --release -p cev-model --test memory_load` loads Kev and d1-omni the way the browser does (files in memory, weights streamed in chunks) and checks every logit against loading from disk.
+- `cargo build -p cev-wasm --target wasm32-unknown-unknown` checks the browser build.
 
 ## Status / next
 

@@ -1,11 +1,13 @@
-//! cev in the browser. The same compile → Qwen3 → adapter pipeline as the
+//! cev in the browser. The same compile → model → adapter pipeline as the
 //! server, with JSON strings in and out (the REST request/response bodies).
 //! The decision log lives in memory; weights are streamed in by the page.
+//! Runs Qwen3 (cev's readout), Kev and d1-omni (text, images and audio).
 
 use cev_core::{Backend, FeedbackRequest, MockBackend, SystemOneRequest};
 use cev_model::weights::{DType, StreamLoader};
-use cev_model::{Engine, EngineOptions};
+use cev_model::{Engine, EngineOptions, MemoryModel};
 use cev_runtime::{ExportFilter, RuntimeConfig, Store};
+use std::collections::HashMap;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
@@ -34,13 +36,54 @@ impl WeightLoader {
         Self(StreamLoader::new(DType::F32))
     }
 
+    /// The streamer for a model kind (`kev`, `d1-omni`, `qwen3`): drops
+    /// towers the backend does not use as they arrive.
+    pub fn for_model(kind: &str) -> Self {
+        Self(cev_model::load::stream_loader(kind))
+    }
+
+    /// Bytes pushed so far.
+    pub fn received(&self) -> usize {
+        self.0.received()
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), JsError> {
         self.0.push(chunk).map_err(err)
     }
 }
 
+/// The small files of a model (configs, tokenizer, adapter, `head.pt`), by name.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct ModelFiles(HashMap<String, Vec<u8>>);
+
+#[wasm_bindgen]
+impl ModelFiles {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, name: &str, bytes: Vec<u8>) {
+        self.0.insert(name.into(), bytes);
+    }
+}
+
 #[wasm_bindgen]
 pub struct Cev(cev_runtime::Cev);
+
+fn browser_opts(model: &str) -> EngineOptions {
+    EngineOptions {
+        model: model.into(),
+        device: "cpu".into(),
+        dtype: "f32".into(),
+        max_context: 8192,
+        // Cached prefixes cost ~0.25 MB per token on Qwen3-0.6B and wasm
+        // memory tops out at 4 GB, most of it weights.
+        prefix_cache_tokens: 1024,
+        ..Default::default()
+    }
+}
 
 fn runtime(backend: Arc<dyn Backend>) -> Result<Cev, JsError> {
     let store = Store::in_memory().map_err(err)?;
@@ -56,18 +99,16 @@ impl Cev {
 
     /// A Qwen3 checkpoint from its files: `model` is the repo id it came from.
     pub fn load(model: &str, config: &[u8], tokenizer: &[u8], tokenizer_config: &str, weights: WeightLoader) -> Result<Cev, JsError> {
-        let opts = EngineOptions {
-            model: model.into(),
-            device: "cpu".into(),
-            dtype: "f32".into(),
-            max_context: 8192,
-            // Cached prefixes cost ~0.25 MB per token on Qwen3-0.6B and wasm
-            // memory tops out at 4 GB, most of it weights.
-            prefix_cache_tokens: 1024,
-            ..Default::default()
-        };
-        let engine = Engine::from_parts(config, tokenizer, tokenizer_config, weights.0.finish().map_err(err)?, opts).map_err(err)?;
+        let engine = Engine::from_parts(config, tokenizer, tokenizer_config, weights.0.finish().map_err(err)?, browser_opts(model)).map_err(err)?;
         runtime(Arc::new(engine))
+    }
+
+    /// Any model the browser can run, from its files: Kev (adapter files
+    /// plus the base's `config.json` and `tokenizer.json`), d1-omni or
+    /// Qwen3. `repo` names it (the adapter's repo for Kev).
+    pub fn load_files(repo: &str, files: ModelFiles, weights: WeightLoader) -> Result<Cev, JsError> {
+        let model = MemoryModel { repo: repo.into(), files: files.0, tensors: weights.0.finish().map_err(err)? };
+        runtime(cev_model::from_memory(model, browser_opts(repo)).map_err(err)?)
     }
 
     /// `GET /v1/models`

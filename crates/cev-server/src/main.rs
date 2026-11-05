@@ -53,6 +53,10 @@ struct Args {
     /// Most option rotations per question when permuting.
     #[arg(long, env = "CEV_MAX_PERMUTATIONS", default_value_t = 4)]
     max_permutations: usize,
+    /// Serve the browser page from this directory (the repository's `web/`)
+    /// at `/`; it then runs its decisions on this server.
+    #[arg(long, env = "CEV_WEB")]
+    web: Option<std::path::PathBuf>,
     /// Use a keyword-matching mock instead of a neural backbone (for wiring tests).
     #[arg(long)]
     mock: bool,
@@ -88,9 +92,15 @@ async fn main() -> Result<()> {
         max_permutations: args.max_permutations,
     };
     let cev = Cev::new(backend, Store::open(&args.db)?, cfg)?;
-    let app = cev_server::app(cev_server::AppState::new(cev, args.concurrency, args.api_key));
+    if let Some(dir) = &args.web {
+        anyhow::ensure!(dir.join("index.html").is_file(), "--web {}: no index.html there", dir.display());
+    }
+    let app = cev_server::app_serving(cev_server::AppState::new(cev, args.concurrency, args.api_key), args.web.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
-    tracing::info!("listening on http://{} (GraphiQL at /graphql)", args.addr);
+    match &args.web {
+        Some(dir) => tracing::info!("listening on http://{} (page from {} at /, GraphiQL at /graphql)", args.addr, dir.display()),
+        None => tracing::info!("listening on http://{} (GraphiQL at /graphql)", args.addr),
+    }
     axum::serve(listener, app).with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); }).await?;
     Ok(())
 }

@@ -132,3 +132,25 @@ async fn images_and_audio_on_the_wire() {
     assert_eq!(model["modalities"], json!(["text", "image", "audio"]));
     assert_eq!(model["family"], "cev");
 }
+
+#[tokio::test]
+async fn serves_the_page_and_takes_big_media() {
+    let dir = std::env::temp_dir().join(format!("cev-web-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("index.html"), "<!doctype html><title>cev</title>").unwrap();
+    let cev = Cev::new(Arc::new(MockBackend::default().with_media()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let app = cev_server::app_serving(cev_server::AppState::new(cev, 1, Some("secret".into())), Some(&dir));
+    // The page needs no token; the API still does.
+    let (s, _, text) = call(&app, "GET", "/", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(text.contains("<title>cev</title>"));
+    let (s, _, _) = call(&app, "GET", "/v1/models", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // A 5 MB image (a camera frame, a long audio window) is past axum's 2 MB default.
+    use base64::Engine as _;
+    let big = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 5 << 20]);
+    let body = json!({"state": "a frame", "images": [big], "questions": {"q": {"type": "noul", "instructions": "ok?"}}});
+    let (s, r, _) = call(&app, "POST", "/v1/systemone?key=secret", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    std::fs::remove_dir_all(&dir).ok();
+}

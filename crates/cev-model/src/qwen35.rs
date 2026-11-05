@@ -639,7 +639,16 @@ impl Qwen35 {
     /// `language_model` or `model`); `lm_head` is the untied output table
     /// when the checkpoint has one.
     pub fn new(cfg: TextConfig, vb: VarBuilder, lm_head: Option<VarBuilder>, max_len: usize) -> Result<Self> {
-        let embed = Embedding::new(vb.pp("embed_tokens").get((cfg.vocab_size, cfg.hidden_size), "weight")?, cfg.hidden_size);
+        let dtype = vb.dtype();
+        Self::with_embed_dtype(cfg, vb, lm_head, max_len, dtype)
+    }
+
+    /// As `new`, with the embedding table (and a tied output table) held in
+    /// `embed_dtype`: rows are converted to the model dtype as they are
+    /// looked up. The browser keeps Qwen3.5's 248k-row table in bf16.
+    pub fn with_embed_dtype(cfg: TextConfig, vb: VarBuilder, lm_head: Option<VarBuilder>, max_len: usize, embed_dtype: DType) -> Result<Self> {
+        let table = vb.pp("embed_tokens").get_with_hints_dtype((cfg.vocab_size, cfg.hidden_size), "weight", Default::default(), embed_dtype)?;
+        let embed = Embedding::new(table, cfg.hidden_size);
         let lm_head = match lm_head {
             Some(h) if !cfg.tie_word_embeddings => h.get((cfg.vocab_size, cfg.hidden_size), "weight")?,
             _ => embed.embeddings().clone(),
@@ -683,7 +692,7 @@ impl Decoder for Qwen35 {
         self.max_len
     }
     fn embed(&self, ids: &[u32]) -> Result<Tensor> {
-        self.embed.embeddings().index_select(&Tensor::new(ids, &self.device)?, 0)
+        self.embed.embeddings().index_select(&Tensor::new(ids, &self.device)?, 0)?.to_dtype(self.dtype)
     }
 
     fn forward(&self, embeds: &Tensor, pos: &Positions, state: Option<&PrefixState>, keep: bool, attn: &Attn) -> Result<(Tensor, Option<PrefixState>)> {

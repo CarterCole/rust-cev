@@ -10,11 +10,13 @@
     --bg: #f6f5f1; --panel: #fff; --ink: #1c1b18; --muted: #6d6a62; --line: #e2dfd6;
     --accent: #2f5fd0; --accent-ink: #fff; --bar: #c9d6f5; --good: #1e7d4f; --bad: #b3372c;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --c0: #3b6fd4; --c1: #e07a3a; --c2: #2f9d6a; --c3: #a95bc4; --c4: #c9a227; --c5: #3fa9bf; --c6: #d0507a; --c7: #7c8a99;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #15151a; --panel: #1e1f26; --ink: #ecebe6; --muted: #9a988f; --line: #33343d;
       --accent: #7da0f5; --accent-ink: #10131c; --bar: #33457a; --good: #5fd09a; --bad: #f08a7e;
+      --c0: #7da0f5; --c1: #f0a070; --c2: #5fd09a; --c3: #c98be0; --c4: #e6c45a; --c5: #6fcde0; --c6: #ec86a6; --c7: #a3afbb;
     }
   }
   * { box-sizing: border-box; }
@@ -33,11 +35,12 @@
   .muted { color: var(--muted); }
   .small { font-size: 13px; }
   label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
-  textarea, select {
+  textarea, select, input[type=number] {
     width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
     border-radius: 6px; padding: 8px; font: 13px/1.45 var(--mono);
   }
   select { width: auto; font-family: inherit; }
+  input[type=number] { width: 64px; padding: 5px 6px; }
   textarea { resize: vertical; }
   button {
     font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
@@ -70,53 +73,118 @@
   th:first-child, td:first-child { text-align: left; font-family: var(--mono); }
   .on { color: var(--good); font-weight: 600; }
   pre { font: 12px/1.5 var(--mono); margin: 8px 0 0; white-space: pre-wrap; }
+  .media { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
+  .media img { height: 64px; border-radius: 6px; border: 1px solid var(--line); }
+  .media audio { height: 32px; }
+  .file { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; margin: 0; }
+  .file input { display: none; }
+  .check { display: inline-flex; gap: 6px; align-items: center; margin: 0; }
+  #live-preview video { max-width: 100%; max-height: 240px; border-radius: 6px; border: 1px solid var(--line); background: #000; }
+  #live-preview audio { width: 100%; }
+  .meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 8px; }
+  .meter div { height: 100%; width: 0; background: var(--good); transition: width .1s; }
+  .track { margin-top: 12px; }
+  .track .name { font: 600 13px var(--mono); }
+  .strip { display: flex; gap: 2px; align-items: stretch; height: 40px; margin-top: 4px; }
+  .strip .tick { display: flex; flex-direction: column-reverse; width: 8px; flex: none; border-radius: 2px; overflow: hidden; background: var(--line); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 </style>
 </head>
 <body>
 <main>
   <h1>cev in the browser</h1>
-  <p class="lede">Typed, calibrated decisions in one forward pass. The engine, the decision log and the online
-    learner are the Rust crates compiled to WebAssembly; nothing leaves this tab.</p>
+  <p class="lede">Typed, calibrated decisions in one forward pass, over text, images, audio and live streams. Decisions
+    run in this tab (the Rust crates compiled to WebAssembly; nothing leaves the tab) or on the local cev server that
+    serves this page.</p>
 
   <section class="panel">
     <div class="row">
+      <select id="where" aria-label="Run on">
+        <option value="tab">In this tab</option>
+      </select>
       <span class="pill" id="backend">starting…</span>
       <span class="muted small grow" id="backend-note"></span>
-      <button id="load-q8" hidden>Load Qwen3-0.6B int8</button>
-      <button id="load">Load Qwen3-0.6B</button>
+      <select id="model" aria-label="Model"></select>
+      <button id="load">Load</button>
     </div>
-    <p class="muted small" id="load-note" style="margin-top:8px">The real model is a 1.5 GB download (cached afterwards)
-      and needs about 3 GB of memory and a desktop browser. Until then answers come from a keyword-overlap stub.</p>
+    <p class="muted small" id="load-note" style="margin-top:8px"></p>
     <progress id="bar" max="1" value="0" hidden></progress>
     <div class="error" id="load-error"></div>
   </section>
 
   <div class="cols">
-    <section class="panel">
-      <div class="row">
-        <h2 class="grow" style="margin:0">Request</h2>
-        <select id="preset" aria-label="Example"></select>
-      </div>
-      <label for="state">State (text or JSON)</label>
-      <textarea id="state" rows="6" spellcheck="false"></textarea>
-      <label for="questions">Questions</label>
-      <textarea id="questions" rows="16" spellcheck="false"></textarea>
-      <div class="row" style="margin-top:12px">
-        <button class="primary" id="decide">Decide</button>
-        <span class="muted small">debias</span>
-        <select id="debias" aria-label="Debias">
-          <option>calibrate</option><option>full</option><option>permute</option><option>none</option>
-        </select>
-        <span class="muted small grow">“full” also averages option rotations: better, about 4× slower here.</span>
-      </div>
-      <div class="error" id="error"></div>
-    </section>
+    <div class="stack">
+      <section class="panel">
+        <div class="row">
+          <h2 class="grow" style="margin:0">Request</h2>
+          <select id="preset" aria-label="Example"></select>
+        </div>
+        <label for="state">State (text or JSON)</label>
+        <textarea id="state" rows="5" spellcheck="false"></textarea>
+        <label>Media <span id="media-note"></span></label>
+        <div class="media">
+          <label class="file"><button type="button" id="pick-image">Add image</button><input type="file" id="image-file" accept="image/*" multiple></label>
+          <label class="file"><button type="button" id="pick-audio">Add WAV</button><input type="file" id="audio-file" accept=".wav,audio/wav,audio/x-wav"></label>
+          <button type="button" id="clear-media" hidden>Clear</button>
+          <span id="media-list" class="media"></span>
+        </div>
+        <label for="questions">Questions</label>
+        <textarea id="questions" rows="14" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" id="decide">Decide</button>
+          <span class="muted small">debias</span>
+          <select id="debias" aria-label="Debias">
+            <option>auto</option><option>calibrate</option><option>full</option><option>permute</option><option>none</option>
+          </select>
+          <span class="muted small grow" id="debias-note"></span>
+        </div>
+        <div class="error" id="error"></div>
+      </section>
+
+      <section class="panel">
+        <div class="row">
+          <h2 class="grow" style="margin:0">Live</h2>
+          <span class="muted small" id="live-status"></span>
+        </div>
+        <p class="small muted" style="margin-top:6px">Asks the questions above over and over about a microphone, camera,
+          screen or media file: the last few seconds of sound, or the current frame. One request at a time; ticks that
+          come while one is running are skipped.</p>
+        <div class="row" style="margin-top:10px">
+          <select id="live-source" aria-label="Source">
+            <option value="mic">Microphone</option><option value="camera">Camera</option>
+            <option value="screen">Screen</option><option value="file">Media file</option>
+          </select>
+          <select id="live-read" aria-label="Read">
+            <option value="sound">sound</option><option value="frames">frames</option>
+          </select>
+          <span class="muted small" id="live-window-label">last</span><input id="live-window" type="number" min="1" max="30" step="0.5" value="5" aria-label="Window seconds"><span class="muted small" id="live-window-unit">s</span>
+          <span class="muted small">every</span><input id="live-every" type="number" min="0.5" max="60" step="0.5" value="2" aria-label="Interval seconds"><span class="muted small">s</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="check small"><input type="checkbox" id="live-log"> keep in the decision log</label>
+          <span class="grow"></span>
+          <button class="primary" id="live-start">Start</button>
+        </div>
+        <div class="row" id="live-file-row" style="margin-top:10px" hidden>
+          <label class="file"><button type="button" id="live-pick">Choose audio or video</button><input type="file" id="live-file" accept="audio/*,video/*"></label>
+          <span class="muted small">or an example:</span>
+          <button type="button" data-example="examples/calls.wav">two voicemails</button>
+          <button type="button" data-example="examples/checkout.webm">checkout screens</button>
+          <span class="muted small" id="live-file-name"></span>
+        </div>
+        <div id="live-preview" class="media"></div>
+        <div class="meter" id="live-meter" hidden><div></div></div>
+        <div class="error" id="live-error"></div>
+        <div id="live-timeline"></div>
+      </section>
+    </div>
 
     <div class="stack">
       <section class="panel">
         <h2>Answers</h2>
-        <div id="answers"><p class="muted">Press Decide. Then click the option that was actually right to send it
-          back as a label.</p></div>
+        <div id="answers"><p class="muted">Press Decide (or start Live). Then click the option that was actually right
+          to send it back as a label.</p></div>
         <p class="note" id="meta"></p>
       </section>
 
@@ -150,12 +218,14 @@ const el = (tag, props = {}, ...kids) => {
   return n;
 };
 
-// --- worker RPC ---
+// --- worker RPC (decisions in this tab) ---
 const worker = new Worker('worker.js', { type: 'module' });
 const pending = new Map();
 let seq = 0;
+let workerError = '';
 const call = (op, ...args) =>
   new Promise((resolve, reject) => {
+    if (workerError) return reject(new Error(workerError));
     pending.set(++seq, { resolve, reject });
     worker.postMessage({ id: seq, op, args });
   });
@@ -167,8 +237,117 @@ worker.onmessage = ({ data }) => {
   else p.resolve(data.result);
 };
 worker.onerror = (e) => {
-  $('load-error').textContent = `Worker failed: ${e.message || 'could not start (run scripts/build_web.sh first?)'}`;
+  workerError = `The in-tab engine failed to start: ${e.message || 'run scripts/build_web.sh first?'}`;
+  for (const p of pending.values()) p.reject(new Error(workerError));
+  pending.clear();
+  if (api === tab) $('load-error').textContent = workerError;
 };
+
+// --- where decisions run ---
+// The same operations, in this tab (wasm worker) or on the cev server that
+// serves this page (`cev --web web`), through its REST API.
+const tab = {
+  model: () => call('model'),
+  decide: (r) => call('decide', r),
+  feedback: (r) => call('feedback', r),
+  tasks: () => call('tasks'),
+  reset_task: (t) => call('reset_task', t),
+  export: (labeled) => call('export', labeled),
+};
+async function http(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    let msg = text;
+    try {
+      msg = JSON.parse(text).error?.message ?? text;
+    } catch {}
+    throw new Error(`${r.status}: ${msg}`);
+  }
+  return text;
+}
+const getJson = async (...a) => JSON.parse(await http(...a));
+const server = {
+  model: async () => (await getJson('GET', 'v1/models')).data[0],
+  decide: (r) => getJson('POST', 'v1/systemone', r),
+  feedback: (r) => getJson('POST', 'v1/feedback', r),
+  tasks: async () => (await getJson('GET', 'v1/tasks')).data,
+  reset_task: (t) => getJson('DELETE', `v1/tasks/${encodeURIComponent(t)}`),
+  export: (labeled) => http('GET', `v1/export?labeled=${labeled}`),
+};
+let api = tab;
+
+// --- models (in this tab) ---
+const MODELS = {
+  'qwen3-0.6b': { name: 'Qwen3-0.6B', note: '1.5 GB download, about 3 GB of memory. Text. cev’s zero-shot readout.' },
+  'qwen3-0.6b-q8': { name: 'Qwen3-0.6B int8', note: 'Local int8 copy: 0.75 GB, about 1.3 GB of memory. Text.', localOnly: true },
+  'kev-0.8b': { name: 'Kev-0.8B', note: '1.6 GB download (Qwen3.5-0.8B-Base plus the Kev adapter), about 2.6 GB of memory. Text. A trained decision model.' },
+  'd1-omni-600m': { name: 'd1-omni-600M', note: '2.3 GB download, about 2.5 GB of memory. Text, images and audio. A trained decision model.' },
+};
+for (const [key, m] of Object.entries(MODELS)) {
+  if (!m.localOnly) $('model').append(el('option', { value: key, textContent: m.name }));
+}
+// The int8 copy is only offered when it has been built into web/models/.
+call('has_local', 'qwen3-0.6b-q8').then((ok) => {
+  if (ok) $('model').insertBefore(el('option', { value: 'qwen3-0.6b-q8', textContent: MODELS['qwen3-0.6b-q8'].name }), $('model').options[1]);
+}, () => {});
+const modelNote = () => {
+  $('load-note').textContent =
+    api === server
+      ? 'Decisions run on the cev server that serves this page, on its accelerator. Its model is chosen when it starts (`cev --model …`).'
+      : `${MODELS[$('model').value].note} Downloads are cached by the browser; a desktop browser is needed. One thread, so expect seconds to tens of seconds per answer. Until a model is loaded, answers come from a keyword-overlap stub.`;
+};
+$('model').onchange = modelNote;
+
+// --- media ---
+// Images and audio go in the request as data URLs, as on the REST API.
+let images = [];
+let audio = null;
+let modalities = ['text'];
+const can = (m) => modalities.includes(m);
+const dataUrl = (blob) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+const needModel = () => (api === server ? 'restart the server with `--model d1-omni`' : 'load d1-omni-600M');
+function renderMedia() {
+  $('media-list').replaceChildren(
+    ...images.map((src) => el('img', { src, alt: 'attached image' })),
+    ...(audio ? [el('audio', { src: audio, controls: true })] : []),
+  );
+  $('clear-media').hidden = !images.length && !audio;
+  $('pick-image').disabled = !can('image');
+  $('pick-audio').disabled = !can('audio');
+  const unsupported = (images.length && !can('image')) || (audio && !can('audio'));
+  $('media-note').textContent = unsupported
+    ? `· this model cannot take these; ${needModel()}`
+    : can('audio') ? '· images or one WAV (not both)' : can('image') ? '· images' : '· text only with this model';
+}
+$('pick-image').onclick = () => $('image-file').click();
+$('pick-audio').onclick = () => $('audio-file').click();
+$('image-file').onchange = async (e) => {
+  images.push(...(await Promise.all([...e.target.files].map(dataUrl))));
+  e.target.value = '';
+  renderMedia();
+};
+$('audio-file').onchange = async (e) => {
+  if (e.target.files[0]) audio = await dataUrl(e.target.files[0]);
+  e.target.value = '';
+  renderMedia();
+};
+$('clear-media').onclick = () => {
+  images = [];
+  audio = null;
+  renderMedia();
+};
+const fetchMedia = async (path) => dataUrl(await (await fetch(path)).blob());
 
 // --- examples ---
 const PRESETS = {
@@ -202,6 +381,39 @@ const PRESETS = {
       },
     },
   },
+  'Screenshot check': {
+    state: 'A customer sent this screenshot of the checkout page.',
+    images: ['examples/payment-failed.png'],
+    questions: {
+      outcome: {
+        type: 'choice',
+        instructions: 'What does the screenshot show?',
+        criteria: { success: 'The purchase went through', failure: 'Something went wrong' },
+      },
+      needs_help: { type: 'noul', instructions: 'Does the customer need help from support?' },
+    },
+  },
+  'Voicemail': {
+    state: 'A voicemail left on the support line.',
+    audio: 'examples/voicemail-urgent.wav',
+    questions: {
+      callback: { type: 'noul', instructions: 'Does the caller want a call back?' },
+      urgency: { type: 'score', instructions: 'How urgent is the voicemail?', criteria: ['Not urgent', 'Soon', 'Right away'] },
+      sentiment: {
+        type: 'choice',
+        instructions: "What is the caller's mood?",
+        criteria: { happy: 'Pleased', upset: 'Frustrated or worried', neutral: 'Neither' },
+      },
+    },
+  },
+  'Camera watch': {
+    state: 'A frame from a webcam on a desk.',
+    questions: {
+      person: { type: 'noul', instructions: 'Is a person in view?' },
+      attention: { type: 'noul', instructions: 'Is someone looking at the camera?' },
+      light: { type: 'score', instructions: 'How well lit is the scene?', criteria: ['Dark', 'Dim', 'Bright'] },
+    },
+  },
   'Inbox triage': {
     state: 'Subject: Re: Q3 contract renewal\n\nHi, legal signed off this morning. Can you countersign by Friday so we keep the current pricing? Thanks, Dana',
     questions: {
@@ -216,24 +428,49 @@ const PRESETS = {
   },
 };
 for (const name of Object.keys(PRESETS)) $('preset').append(el('option', { textContent: name }));
-const usePreset = () => {
+const usePreset = async () => {
   const p = PRESETS[$('preset').value];
   $('state').value = typeof p.state === 'string' ? p.state : JSON.stringify(p.state, null, 2);
   $('questions').value = JSON.stringify(p.questions, null, 2);
+  images = p.images ? await Promise.all(p.images.map(fetchMedia)) : [];
+  audio = p.audio ? await fetchMedia(p.audio) : null;
+  renderMedia();
 };
 $('preset').onchange = usePreset;
 usePreset();
+
+// The state and questions as typed (JSON state when it parses).
+function readRequest() {
+  const questions = JSON.parse($('questions').value);
+  const text = $('state').value;
+  let state = text;
+  try {
+    state = JSON.parse(text);
+  } catch {}
+  return { state, questions, debias: $('debias').value };
+}
 
 // --- model ---
 let busy = false;
 const setBusy = (b) => {
   busy = b;
-  for (const id of ['decide', 'teach', 'load', 'load-q8']) $(id).disabled = b;
+  for (const id of ['decide', 'teach', 'load', 'model', 'where']) $(id).disabled = b;
 };
 const showModel = (m) => {
   $('backend').textContent = m.id;
+  const runs = api === server ? `cev server at ${location.host}` : 'wasm CPU';
   $('backend-note').textContent =
-    m.backbone === 'mock' ? 'keyword stub, no weights' : `${m.backbone} · hidden ${m.hidden_size} · wasm CPU`;
+    m.backbone === 'mock' ? 'keyword stub, no weights' : `${m.backbone} · ${m.family} · ${m.modalities.join(', ')} · ${runs}`;
+  modalities = m.modalities ?? ['text'];
+  // Zero-shot cev needs debiasing; the trained families are calibrated already ("auto" = none).
+  // In the tab, "calibrate" keeps zero-shot answers affordable; the server can afford "auto" (= full).
+  $('debias').value = m.family === 'cev' && m.backbone !== 'mock' && api === tab ? 'calibrate' : 'auto';
+  $('debias-note').textContent =
+    m.family === 'cev'
+      ? '“auto” is “full” for this model: it also averages option rotations, better and about 4× slower.'
+      : '“auto” is “none” for this model: it was trained to answer calibrated.';
+  renderMedia();
+  liveSourceChanged();
 };
 function onProgress({ text, done, total }) {
   $('bar').hidden = false;
@@ -242,12 +479,12 @@ function onProgress({ text, done, total }) {
   const mb = (n) => (n / 2 ** 20).toFixed(0);
   $('load-note').textContent = total ? `${text} · ${mb(done)} / ${mb(total)} MB` : text;
 }
-const loadModel = async (variant) => {
+const loadModel = async () => {
   setBusy(true);
   $('load-error').textContent = '';
   try {
     const t = performance.now();
-    showModel(await call('load', 'Qwen/Qwen3-0.6B', variant));
+    showModel(await call('load', $('model').value));
     $('load-note').textContent = `Loaded in ${((performance.now() - t) / 1000).toFixed(1)} s. The first request with a new state or question set is the slow one; prefixes and calibration are cached after that.`;
     $('answers').replaceChildren(el('p', { className: 'muted', textContent: 'Model changed: press Decide.' }));
     $('meta').textContent = '';
@@ -255,18 +492,29 @@ const loadModel = async (variant) => {
   } catch (e) {
     $('load-error').textContent = e.message;
     $('load-note').textContent = 'Loading failed; back on the stub.';
-    call('model').then(showModel);
+    call('model').then(showModel, () => {});
   } finally {
     $('bar').hidden = true;
     setBusy(false);
   }
 };
 $('load').onclick = () => loadModel();
-$('load-q8').onclick = () => loadModel('q8');
-// The int8 copy is only offered when it has been built into web/models/.
-call('has_local', 'Qwen3-0.6B-q8').then((ok) => {
-  $('load-q8').hidden = !ok;
-});
+
+async function useWhere(where) {
+  await stopLive();
+  api = where === 'server' ? server : tab;
+  $('model').hidden = $('load').hidden = api === server;
+  $('load-error').textContent = api === tab ? workerError : '';
+  modelNote();
+  $('tasks').replaceChildren(el('tr', {}, el('td', { colSpan: 7, className: 'muted', style: 'font-family:inherit', textContent: 'No labels yet.' })));
+  try {
+    showModel(await api.model());
+    refreshTasks();
+  } catch (e) {
+    $('load-error').textContent = e.message;
+  }
+}
+$('where').onchange = () => useWhere($('where').value);
 
 // --- decide + feedback ---
 const pct = (p) => `${(p * 100).toFixed(1)}%`;
@@ -284,14 +532,14 @@ function optionsOf(a) {
     a.type === 'score' ? { name: k, detail: a.legend[k], p, label: Number(k) } : { name: k, p, label: k },
   );
 }
+const verdictOf = (a) =>
+  a.type === 'noul' ? `${pct(a.noul)} yes`
+  : a.type === 'choice' ? `${a.choice} · confidence ${a.confidence.toFixed(2)}`
+  : `level ${a.score.toFixed(2)} · confidence ${a.confidence.toFixed(2)}`;
 
 function renderAnswer(id, a) {
   const opts = optionsOf(a);
   const top = argmax(opts.map((o) => o.p));
-  const verdict =
-    a.type === 'noul' ? `${pct(a.noul)} yes`
-    : a.type === 'choice' ? `${a.choice} · confidence ${a.confidence.toFixed(2)}`
-    : `level ${a.score.toFixed(2)} · confidence ${a.confidence.toFixed(2)}`;
   const note = el('p', { className: 'note' });
   if (a.x_cev?.adapted) note.textContent = 'Served by the online adapter.';
   const rows = opts.map((o, i) => {
@@ -301,9 +549,12 @@ function renderAnswer(id, a) {
       el('span', { className: 'pct', textContent: pct(o.p) }));
     b.firstChild.style.width = pct(o.p);
     b.onclick = async () => {
-      if (!a.x_cev?.decision_id) return;
+      if (!a.x_cev?.decision_id) {
+        note.textContent = 'Not in the decision log, so it cannot be labelled (live ticks are kept only when “keep in the decision log” is on).';
+        return;
+      }
       try {
-        const fb = await call('feedback', { decision_id: a.x_cev.decision_id, label: o.label });
+        const fb = await api.feedback({ decision_id: a.x_cev.decision_id, label: o.label });
         for (const r of rows) r.classList.toggle('labeled', r === b);
         note.textContent = `Labelled “${o.name}” · loss ${fb.served_loss.toFixed(3)} · ${fb.task_examples} label${fb.task_examples === 1 ? '' : 's'} for this task · adapter ${fb.adapter_active ? 'active' : 'not active yet'}`;
         refreshTasks();
@@ -318,31 +569,31 @@ function renderAnswer(id, a) {
       el('span', { className: 'qid', textContent: id }),
       el('span', { className: 'muted small', textContent: a.type }),
       el('span', { className: 'grow' }),
-      el('span', { className: 'verdict', textContent: verdict })),
+      el('span', { className: 'verdict', textContent: verdictOf(a) })),
     ...rows, note);
 }
+const showAnswers = (r, ms, extra = '') => {
+  $('answers').replaceChildren(...Object.entries(r.answers).map(([id, a]) => renderAnswer(id, a)));
+  $('meta').textContent = `${r.model} · ${r.usage.input_tokens} input tokens · ${Math.round(ms)} ms${extra}${r.request_id ? ` · ${r.request_id}` : ''}`;
+};
 
 $('decide').onclick = async () => {
   $('error').textContent = '';
-  let questions;
+  let req;
   try {
-    questions = JSON.parse($('questions').value);
+    req = readRequest();
   } catch (e) {
     $('error').textContent = `Questions are not valid JSON: ${e.message}`;
     return;
   }
-  const text = $('state').value;
-  let state = text;
-  try {
-    state = JSON.parse(text);
-  } catch {}
+  if (images.length) req.images = images;
+  if (audio) req.audio = audio;
   setBusy(true);
   $('decide').textContent = 'Deciding…';
   try {
     const t = performance.now();
-    const r = await call('decide', { state, questions, debias: $('debias').value });
-    $('answers').replaceChildren(...Object.entries(r.answers).map(([id, a]) => renderAnswer(id, a)));
-    $('meta').textContent = `${r.model} · ${r.usage.input_tokens} input tokens · ${Math.round(performance.now() - t)} ms · ${r.request_id}`;
+    const r = await api.decide(req);
+    showAnswers(r, performance.now() - t);
   } catch (e) {
     $('error').textContent = e.message;
   } finally {
@@ -354,14 +605,279 @@ document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !busy) $('decide').click();
 });
 
+// --- live ---
+// Sound: an AudioWorklet copies the mono mix of the input into a ring of
+// chunks; each tick sends the last `window` seconds as a 16-bit WAV.
+// Frames: each tick draws the current video frame to a canvas and sends a JPEG.
+const TAP = `registerProcessor('tap', class extends AudioWorkletProcessor {
+  process(inputs) {
+    const chans = inputs[0];
+    if (chans.length) {
+      const m = new Float32Array(chans[0].length);
+      for (const c of chans) for (let i = 0; i < m.length; i++) m[i] += c[i] / chans.length;
+      this.port.postMessage(m, [m.buffer]);
+    }
+    return true;
+  }
+});`;
+const live = { on: false, busy: false, ticks: 0, skipped: 0, timer: null, stream: null, ctx: null, chunks: [], samples: 0, rate: 0, media: null, video: null, url: null, started: 0, history: [], ms: [] };
+let liveFile = null; // { url, name, video }
+
+function liveSourceChanged() {
+  const src = $('live-source').value;
+  $('live-file-row').hidden = src !== 'file';
+  if (src === 'mic') $('live-read').value = 'sound';
+  else if (src === 'camera' || src === 'screen') $('live-read').value = 'frames';
+  else if (liveFile) $('live-read').value = liveFile.video ? 'frames' : 'sound';
+  liveReadChanged();
+}
+function liveReadChanged() {
+  const sound = $('live-read').value === 'sound';
+  for (const id of ['live-window', 'live-window-label', 'live-window-unit']) $(id).hidden = !sound;
+  const need = sound ? 'audio' : 'image';
+  $('live-error').textContent = !live.on && !can(need) ? `This model cannot take ${sound ? 'audio' : 'images'}; ${needModel()}.` : '';
+}
+$('live-source').onchange = liveSourceChanged;
+$('live-read').onchange = liveReadChanged;
+const setLiveFile = (url, name, type) => {
+  if (liveFile?.url?.startsWith('blob:')) URL.revokeObjectURL(liveFile.url);
+  liveFile = { url, name, video: type.startsWith('video/') };
+  $('live-file-name').textContent = name;
+  $('live-source').value = 'file';
+  liveSourceChanged();
+};
+$('live-pick').onclick = () => $('live-file').click();
+$('live-file').onchange = (e) => {
+  const f = e.target.files[0];
+  if (f) setLiveFile(URL.createObjectURL(f), f.name, f.type);
+  e.target.value = '';
+};
+for (const b of document.querySelectorAll('[data-example]')) {
+  b.onclick = () => {
+    const path = b.dataset.example;
+    setLiveFile(path, path.split('/').pop(), path.endsWith('.webm') ? 'video/webm' : 'audio/wav');
+    // The voicemail questions fit the clip; the screenshot ones fit the video.
+    $('preset').value = path.endsWith('.webm') ? 'Screenshot check' : 'Voicemail';
+    usePreset().then(() => {
+      images = [];
+      audio = null;
+      renderMedia();
+    });
+  };
+}
+
+function wavBlob(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const tag = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  tag(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); tag(8, 'WAVE');
+  tag(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  tag(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 0x7fff, true);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+// The last `seconds` of captured sound.
+function lastSound(seconds) {
+  const n = Math.min(live.samples, Math.round(seconds * live.rate));
+  const out = new Float32Array(n);
+  let at = n;
+  for (let i = live.chunks.length - 1; i >= 0 && at > 0; i--) {
+    const c = live.chunks[i];
+    const take = Math.min(c.length, at);
+    out.set(c.subarray(c.length - take), at - take);
+    at -= take;
+  }
+  return out;
+}
+async function frameUrl(video) {
+  const s = Math.min(1, 1024 / Math.max(video.videoWidth, video.videoHeight));
+  const c = el('canvas', { width: Math.round(video.videoWidth * s), height: Math.round(video.videoHeight * s) });
+  c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+  return dataUrl(await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9)));
+}
+
+async function startLive() {
+  $('live-error').textContent = '';
+  const src = $('live-source').value;
+  const sound = $('live-read').value === 'sound';
+  if (!can(sound ? 'audio' : 'image')) throw new Error(`This model cannot take ${sound ? 'audio' : 'images'}; ${needModel()}.`);
+  readRequest(); // fail early on bad JSON
+  Object.assign(live, { ticks: 0, skipped: 0, chunks: [], samples: 0, history: [], ms: [], media: null, video: null, stream: null, ctx: null });
+  let node = null;
+  if (src === 'file') {
+    if (!liveFile) throw new Error('Choose a file or an example first.');
+    const m = el(liveFile.video ? 'video' : 'audio', { src: liveFile.url, controls: true, playsInline: true });
+    $('live-preview').replaceChildren(m);
+    live.media = m;
+    if (liveFile.video) live.video = m;
+    if (!sound && !liveFile.video) throw new Error('An audio file has no frames; read its sound.');
+  } else {
+    const ask = src === 'mic' ? navigator.mediaDevices.getUserMedia({ audio: true })
+      : src === 'camera' ? navigator.mediaDevices.getUserMedia({ video: true, audio: sound })
+      : navigator.mediaDevices.getDisplayMedia({ video: true, audio: sound });
+    live.stream = await ask;
+    if (live.stream.getVideoTracks().length) {
+      live.video = el('video', { srcObject: live.stream, muted: true, autoplay: true, playsInline: true });
+      $('live-preview').replaceChildren(live.video);
+    } else {
+      $('live-preview').replaceChildren(el('span', { className: 'muted small', textContent: 'Listening to the microphone.' }));
+    }
+    if (sound && !live.stream.getAudioTracks().length) throw new Error('This source gave no sound track.');
+  }
+  if (sound) {
+    live.ctx = new AudioContext();
+    live.rate = live.ctx.sampleRate;
+    await live.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([TAP], { type: 'text/javascript' })));
+    node = live.media ? live.ctx.createMediaElementSource(live.media) : live.ctx.createMediaStreamSource(live.stream);
+    if (live.media) node.connect(live.ctx.destination); // a played file stays audible
+    const tap = new AudioWorkletNode(live.ctx, 'tap');
+    const mute = live.ctx.createGain();
+    mute.gain.value = 0;
+    node.connect(tap).connect(mute).connect(live.ctx.destination);
+    tap.port.onmessage = ({ data }) => {
+      live.chunks.push(data);
+      live.samples += data.length;
+      const keep = Math.round(30 * live.rate);
+      while (live.chunks.length > 1 && live.samples - live.chunks[0].length >= keep) live.samples -= live.chunks.shift().length;
+      let sum = 0;
+      for (const x of data) sum += x * x;
+      $('live-meter').firstChild.style.width = `${Math.min(100, Math.sqrt(sum / data.length) * 400)}%`;
+    };
+    await live.ctx.resume();
+  }
+  $('live-meter').hidden = !sound;
+  if (live.media) {
+    live.media.onended = async () => {
+      // One last look at the end of the file, then stop.
+      clearInterval(live.timer);
+      while (live.busy) await new Promise((r) => setTimeout(r, 100));
+      if (!(live.history.at(-1)?.at >= live.media.duration - 0.25)) await tick(true);
+      stopLive(false);
+    };
+    await live.media.play();
+  }
+  live.on = true;
+  live.started = performance.now();
+  $('live-start').textContent = 'Stop';
+  for (const id of ['live-source', 'live-read', 'live-window', 'live-every', 'where']) $(id).disabled = true;
+  live.timer = setInterval(() => tick(false), Math.max(0.5, Number($('live-every').value) || 2) * 1000);
+  status();
+}
+
+async function stopLive(clear = true) {
+  clearInterval(live.timer);
+  live.timer = null;
+  if (!live.on && !live.stream && !live.ctx) return;
+  live.on = false;
+  live.stream?.getTracks().forEach((t) => t.stop());
+  live.media?.pause();
+  await live.ctx?.close().catch(() => {});
+  Object.assign(live, { stream: null, ctx: null });
+  if (clear) $('live-preview').replaceChildren(...(live.media ? [live.media] : []));
+  $('live-meter').hidden = true;
+  $('live-start').textContent = 'Start';
+  for (const id of ['live-source', 'live-read', 'live-window', 'live-every', 'where']) $(id).disabled = false;
+  status();
+}
+
+const status = () => {
+  const ms = live.ms.length ? ` · ${Math.round(live.ms.reduce((a, b) => a + b) / live.ms.length)} ms per answer` : '';
+  $('live-status').textContent = live.on || live.ticks
+    ? `${live.on ? 'running · ' : ''}${live.ticks} answer${live.ticks === 1 ? '' : 's'}${ms}${live.skipped ? ` · ${live.skipped} skipped while busy` : ''}`
+    : '';
+};
+
+async function tick(final) {
+  if (!final && !live.on) return;
+  if (live.busy) {
+    live.skipped++;
+    return status();
+  }
+  if (live.media && !final && live.media.paused) return;
+  const sound = $('live-read').value === 'sound';
+  const at = live.media ? live.media.currentTime : (performance.now() - live.started) / 1000;
+  let req;
+  try {
+    req = { ...readRequest(), no_store: !$('live-log').checked };
+    if (sound) {
+      if (live.samples < live.rate * 0.5) return;
+      req.audio = await dataUrl(wavBlob(lastSound(Number($('live-window').value) || 5), live.rate));
+    } else {
+      if (!live.video || live.video.readyState < 2 || !live.video.videoWidth) return;
+      req.images = [await frameUrl(live.video)];
+    }
+  } catch (e) {
+    $('live-error').textContent = e.message;
+    return;
+  }
+  live.busy = true;
+  const t = performance.now();
+  try {
+    const r = await api.decide(req);
+    const ms = performance.now() - t;
+    live.ticks++;
+    live.ms = [...live.ms.slice(-9), ms];
+    showAnswers(r, ms, ` · live at ${at.toFixed(1)} s`);
+    live.history = [...live.history.slice(-79), { at, answers: r.answers }];
+    renderTimeline();
+    $('live-error').textContent = '';
+  } catch (e) {
+    $('live-error').textContent = e.message;
+  } finally {
+    live.busy = false;
+    status();
+  }
+}
+
+// One strip per question: a stacked bar per answer, oldest on the left.
+function renderTimeline() {
+  const ids = Object.keys(live.history.at(-1)?.answers ?? {});
+  $('live-timeline').replaceChildren(...ids.map((id) => {
+    const names = optionsOf(live.history.at(-1).answers[id]).map((o) => o.name);
+    const color = (i) => `var(--c${i % 8})`;
+    const bars = live.history.filter((h) => h.answers[id]).map((h) => {
+      const a = h.answers[id];
+      return el('div', { className: 'tick', title: `${h.at.toFixed(1)} s · ${verdictOf(a)}` },
+        ...optionsOf(a).map((o, i) => {
+          const seg = el('div');
+          seg.style.height = `${o.p * 100}%`;
+          seg.style.background = color(i);
+          return seg;
+        }));
+    });
+    return el('div', { className: 'track' },
+      el('div', { className: 'row' },
+        el('span', { className: 'name', textContent: id }),
+        el('span', { className: 'grow' }),
+        el('span', { className: 'small muted', textContent: verdictOf(live.history.at(-1).answers[id]) })),
+      el('div', { className: 'strip' }, ...bars),
+      el('div', { className: 'legend' }, ...names.map((n, i) => {
+        const sw = el('i');
+        sw.style.background = color(i);
+        return el('span', {}, sw, n);
+      })));
+  }));
+}
+
+$('live-start').onclick = async () => {
+  if (live.on) return stopLive();
+  try {
+    await startLive();
+  } catch (e) {
+    $('live-error').textContent = e.name === 'NotAllowedError' ? 'The browser did not allow access to that device.' : e.message;
+    stopLive();
+  }
+};
+
 // --- online learning ---
 async function refreshTasks() {
-  const tasks = await call('tasks');
+  const tasks = await api.tasks().catch(() => []);
   if (!tasks.length) return;
   $('tasks').replaceChildren(...tasks.map((t) => {
     const reset = el('button', { textContent: 'reset', className: 'small' });
     reset.onclick = async () => {
-      await call('reset_task', t.task);
+      await api.reset_task(t.task);
       reset.closest('tr').remove();
     };
     return el('tr', {},
@@ -413,7 +929,7 @@ $('teach').onclick = async () => {
   const log = $('teach-log');
   const debias = $('debias').value;
   const ask = (ticket, extra) =>
-    call('decide', {
+    api.decide({
       state: { ticket },
       questions: { severity: { type: 'score', instructions: 'How severe is this ticket?', criteria: LEVELS, task: 'demo_severity' } },
       debias,
@@ -424,12 +940,12 @@ $('teach').onclick = async () => {
   const test = TICKETS.filter((_, i) => i % 10 >= 7);
   setBusy(true);
   try {
-    await call('reset_task', 'demo_severity');
+    await api.reset_task('demo_severity');
     let active = false;
     for (const [i, [ticket, level]] of train.entries()) {
       log.textContent = `teaching ${i + 1}/${train.length} (debias ${debias})${active ? ' · adapter serving' : ''}`;
       const a = await ask(ticket);
-      active = (await call('feedback', { decision_id: a.x_cev.decision_id, label: level })).adapter_active;
+      active = (await api.feedback({ decision_id: a.x_cev.decision_id, label: level })).adapter_active;
       refreshTasks();
     }
     let base = 0;
@@ -452,7 +968,7 @@ $('teach').onclick = async () => {
 };
 
 $('export').onclick = async () => {
-  const ndjson = await call('export', true);
+  const ndjson = await api.export(true);
   if (!ndjson) {
     $('teach-log').textContent = 'Nothing to export yet: label an answer first.';
     return;
@@ -462,9 +978,17 @@ $('export').onclick = async () => {
   URL.revokeObjectURL(a.href);
 };
 
-call('model').then(showModel, (e) => {
-  $('load-error').textContent = e.message;
-});
+// --- start ---
+// Served by `cev --web`? Then decisions default to that server.
+const onServer = await fetch('v1/models').then(
+  (r) => r.ok && (r.headers.get('content-type') ?? '').includes('json'),
+  () => false,
+);
+if (onServer) {
+  $('where').prepend(el('option', { value: 'server', textContent: 'On the cev server' }));
+  $('where').value = 'server';
+}
+await useWhere($('where').value);
 </script>
 </body>
 </html>
