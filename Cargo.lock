@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "cev-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "cev-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "cev-model"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "cev-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "cev-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "cev-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "cev-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cev-core",
  "cev-model",
