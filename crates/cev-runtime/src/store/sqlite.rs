@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     hidden       BLOB,
     created_at   INTEGER NOT NULL,
     namespace    TEXT NOT NULL DEFAULT '',
+    hidden_dtype TEXT NOT NULL DEFAULT 'f32',
     UNIQUE (request_id, question_id)
 );
 CREATE INDEX IF NOT EXISTS decisions_task ON decisions(model, task, created_at);
@@ -85,6 +86,10 @@ DROP TABLE adapters;
 ALTER TABLE adapters_ns RENAME TO adapters;
 "#;
 
+/// Databases from before hidden states were stored as half floats: their
+/// existing rows are full floats, which the default says.
+const MIGRATE_HIDDEN_DTYPE: &str = "ALTER TABLE decisions ADD COLUMN hidden_dtype TEXT NOT NULL DEFAULT 'f32';";
+
 const INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS decisions_namespace ON decisions(model, namespace, task, created_at);
 "#;
@@ -95,6 +100,27 @@ fn f32_blob(v: &[f32]) -> Vec<u8> {
 
 fn blob_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// Hidden states are kept as half floats, which halves what every stored
+/// decision costs. Real final-layer values sit far inside the range (the
+/// largest seen on Qwen3-1.7B is about 65, the limit is 65504) and rounding
+/// moves the probe's standardized features by about 0.1%. Anything out of
+/// range saturates and a non-finite value becomes 0, so one bad value cannot
+/// poison the features.
+fn f16_blob(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| half::f16::from_f32(if x.is_finite() { x.clamp(-65504.0, 65504.0) } else { 0.0 }).to_le_bytes())
+        .collect()
+}
+
+/// Decode a stored hidden state by the dtype recorded next to it.
+fn blob_hidden(b: &[u8], dtype: &str) -> Vec<f32> {
+    if dtype == "f16" {
+        b.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect()
+    } else {
+        blob_f32(b)
+    }
 }
 
 pub struct Store {
@@ -120,6 +146,14 @@ impl Store {
         if !has_namespace {
             conn.execute_batch(&format!("BEGIN; {MIGRATE_NAMESPACES} COMMIT;"))?;
         }
+        let has_dtype: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'hidden_dtype'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_dtype {
+            conn.execute_batch(MIGRATE_HIDDEN_DTYPE)?;
+        }
         conn.execute_batch(INDEXES)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -133,7 +167,7 @@ impl Store {
         )?;
         {
             let sql = format!(
-                "INSERT INTO decisions ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO decisions ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'f16')",
                 Self::DECISION_COLS
             );
             let mut st = tx.prepare(&sql)?;
@@ -152,7 +186,7 @@ impl Store {
                     f32_blob(&d.base_logits),
                     serde_json::to_string(&d.served)?,
                     d.adapted,
-                    d.hidden.as_deref().map(f32_blob),
+                    d.hidden.as_deref().map(f16_blob),
                     d.created_at,
                     d.namespace,
                 ])?;
@@ -162,12 +196,13 @@ impl Store {
         Ok(())
     }
 
-    const DECISION_COLS: &'static str = "decision_id, request_id, question_id, model, task, kind, question, options, codes, suffix, base_logits, served, adapted, hidden, created_at, namespace";
+    const DECISION_COLS: &'static str = "decision_id, request_id, question_id, model, task, kind, question, options, codes, suffix, base_logits, served, adapted, hidden, created_at, namespace, hidden_dtype";
 
     fn row_decision(row: &rusqlite::Row) -> rusqlite::Result<DecisionRecord> {
         fn de<T: serde::de::DeserializeOwned>(s: String) -> rusqlite::Result<T> {
             serde_json::from_str(&s).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
+        let dtype: String = row.get(16)?;
         Ok(DecisionRecord {
             decision_id: row.get(0)?,
             request_id: row.get(1)?,
@@ -182,7 +217,7 @@ impl Store {
             base_logits: blob_f32(&row.get::<_, Vec<u8>>(10)?),
             served: de(row.get(11)?)?,
             adapted: row.get(12)?,
-            hidden: row.get::<_, Option<Vec<u8>>>(13)?.map(|b| blob_f32(&b)),
+            hidden: row.get::<_, Option<Vec<u8>>>(13)?.map(|b| blob_hidden(&b, &dtype)),
             created_at: row.get(14)?,
             namespace: row.get(15)?,
         })
@@ -290,7 +325,7 @@ impl Store {
     pub fn replay(&self, model: &str, namespace: &str, task: &str, limit: usize) -> Result<Vec<Sample>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT d.decision_id, d.options, d.base_logits, d.hidden, f.target, f.weight FROM feedback f
+            "SELECT d.decision_id, d.options, d.base_logits, d.hidden, f.target, f.weight, d.hidden_dtype FROM feedback f
              JOIN decisions d ON d.decision_id = f.decision_id
              WHERE d.model = ?1 AND d.task = ?2 AND d.namespace = ?4 AND f.target IS NOT NULL AND d.hidden IS NOT NULL
                AND f.rowid = (SELECT f2.rowid FROM feedback f2 WHERE f2.decision_id = f.decision_id
@@ -304,7 +339,7 @@ impl Store {
                     decision_id: r.get(0)?,
                     names: options.into_iter().map(|o| o.name).collect(),
                     logits: blob_f32(&r.get::<_, Vec<u8>>(2)?),
-                    hidden: blob_f32(&r.get::<_, Vec<u8>>(3)?),
+                    hidden: blob_hidden(&r.get::<_, Vec<u8>>(3)?, &r.get::<_, String>(6)?),
                     target: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
                     weight: r.get::<_, f64>(5)? as f32,
                 })
@@ -333,6 +368,19 @@ impl Store {
         Ok(rows
             .into_iter()
             .filter_map(|(ns, t, d)| serde_json::from_str(&d).ok().map(|a| (ns, t, a)))
+            .collect())
+    }
+
+    /// Every adapter of every model.
+    pub fn all_adapters(&self) -> Result<Vec<super::AdapterRow>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare("SELECT model, namespace, task, data FROM adapters ORDER BY model, namespace, task")?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(model, namespace, task, d)| serde_json::from_str(&d).ok().map(|adapter| super::AdapterRow { model, namespace, task, adapter }))
             .collect())
     }
 
@@ -384,18 +432,20 @@ impl Store {
         let mut n = 0;
         while let Some(r) = rows.next()? {
             let d = Self::row_decision(r)?;
-            let prefix: String = r.get(16)?;
+            // The joined columns follow the decision's own, wherever those end.
+            let o = Self::DECISION_COLS.split(", ").count();
+            let prefix: String = r.get(o)?;
             let js = |i: usize| -> rusqlite::Result<Option<String>> { r.get(i) };
             let row = ExportRow {
                 prompt: format!("{prefix}{}", d.suffix),
-                state: serde_json::from_str(&r.get::<_, String>(17)?).unwrap_or(Value::Null),
-                feedback_id: r.get(18)?,
-                label: js(19)?.and_then(|s| serde_json::from_str(&s).ok()),
-                target: js(20)?.and_then(|s| serde_json::from_str(&s).ok()),
-                weight: r.get::<_, Option<f64>>(21)?.unwrap_or(1.0),
-                comment: r.get(22)?,
-                metadata: js(23)?.and_then(|s| serde_json::from_str(&s).ok()),
-                labeled_at: r.get(24)?,
+                state: serde_json::from_str(&r.get::<_, String>(o + 1)?).unwrap_or(Value::Null),
+                feedback_id: r.get(o + 2)?,
+                label: js(o + 3)?.and_then(|s| serde_json::from_str(&s).ok()),
+                target: js(o + 4)?.and_then(|s| serde_json::from_str(&s).ok()),
+                weight: r.get::<_, Option<f64>>(o + 5)?.unwrap_or(1.0),
+                comment: r.get(o + 6)?,
+                metadata: js(o + 7)?.and_then(|s| serde_json::from_str(&s).ok()),
+                labeled_at: r.get(o + 8)?,
                 base_probabilities: cev_core::math::softmax(&d.base_logits),
                 options: d.options.iter().map(|o| o.name.clone()).collect(),
                 decision_id: d.decision_id,
@@ -426,5 +476,25 @@ impl Store {
             feedback: q("SELECT COUNT(*) FROM feedback")?,
             labeled_decisions: q("SELECT COUNT(DISTINCT decision_id) FROM feedback WHERE target IS NOT NULL")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn half_float_blobs_round_trip_and_stay_safe() {
+        let v = [0.0f32, 1.5, -2.25, 40.0, 64.8, 1e-3, 1e9, -1e9, f32::NAN, f32::INFINITY];
+        let b = f16_blob(&v);
+        assert_eq!(b.len(), 2 * v.len());
+        let back = blob_hidden(&b, "f16");
+        for (x, y) in v[..6].iter().zip(&back) {
+            assert!((x - y).abs() <= x.abs() * 1e-3 + 1e-6, "{x} -> {y}");
+        }
+        // Out of range saturates, non-finite becomes zero: nothing can poison the features.
+        assert_eq!(&back[6..], &[65504.0, -65504.0, 0.0, 0.0]);
+        // Full-float rows keep decoding by their dtype.
+        assert_eq!(blob_hidden(&f32_blob(&[1.0, -2.0]), "f32"), vec![1.0, -2.0]);
     }
 }

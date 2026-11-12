@@ -75,6 +75,19 @@ pub struct TaskInfo {
     /// Decayed prequential log loss on labels, before learning from them.
     pub base_loss: f64,
     pub adapted_loss: f64,
+    /// The same comparison on the Brier score.
+    pub base_brier: f64,
+    pub adapted_brier: f64,
+}
+
+/// What [`Cev::import_adapters`] did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ImportStats {
+    pub imported: usize,
+    /// Left alone because the task already had an adapter here.
+    pub skipped: usize,
+    /// Imported with the probe restarted, because the hidden size differs.
+    pub probe_reset: usize,
 }
 
 pub struct Cev {
@@ -399,7 +412,7 @@ impl Cev {
         let mut adapters = self.adapters.lock();
         let a = adapters
             .entry((namespace.to_string(), task.to_string()))
-            .or_insert_with(|| Adapter::new(self.backend.hidden_size()));
+            .or_insert_with(|| Adapter::with_probe(self.backend.hidden_size(), self.cfg.learn.probe_dim));
         a.learn(s, &norm, &self.cfg.learn);
         self.store.save_adapter(self.backend.id(), namespace, task, a)?;
         drop(adapters);
@@ -471,7 +484,37 @@ impl Cev {
             temperature: a.temperature(),
             base_loss: a.base_loss,
             adapted_loss: a.adapted_loss,
+            base_brier: a.base_brier,
+            adapted_brier: a.adapted_brier,
         }
+    }
+
+    /// Take adapters fit elsewhere (another database, or an older checkpoint)
+    /// as starting points for this backbone, whatever model they came from.
+    ///
+    /// They are not served until they beat the base model on labels received
+    /// here (see [`Adapter::transplant`]). Tasks that already have an adapter
+    /// are kept unless `overwrite` is set.
+    pub fn import_adapters(&self, rows: &[crate::store::AdapterRow], overwrite: bool) -> CevResult<ImportStats> {
+        let model = self.backend.id();
+        let dim = self.backend.hidden_size();
+        let mut stats = ImportStats::default();
+        let mut adapters = self.adapters.lock();
+        for row in rows {
+            let namespace = namespace_key(Some(&row.namespace))?;
+            let key = (namespace.clone(), row.task.clone());
+            if adapters.contains_key(&key) && !overwrite {
+                stats.skipped += 1;
+                continue;
+            }
+            let mut a = row.adapter.transplant(dim, self.cfg.learn.probe_dim);
+            a.set_buffer(self.store.replay(model, &namespace, &row.task, self.cfg.learn.buffer)?);
+            self.store.save_adapter(model, &namespace, &row.task, &a)?;
+            stats.probe_reset += usize::from(row.adapter.dim != dim);
+            adapters.insert(key, a);
+            stats.imported += 1;
+        }
+        Ok(stats)
     }
 
     /// Drop a task's adapter in one namespace (labels stay in the log).

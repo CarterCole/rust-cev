@@ -5,5 +5,5 @@ pub mod service;
 pub mod store;
 
 pub use adapter::LearnConfig;
-pub use service::{Cev, CevError, CevResult, RuntimeConfig, TaskInfo};
-pub use store::{ExportFilter, ExportRow, Store};
+pub use service::{Cev, CevError, CevResult, ImportStats, RuntimeConfig, TaskInfo};
+pub use store::{AdapterRow, ExportFilter, ExportRow, Store};

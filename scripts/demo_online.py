@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Online-learning demo against a running cev server (stdlib only).
 
-    cev --model Qwen/Qwen3-0.6B --min-examples 4 &
+    cev --model Qwen/Qwen3-0.6B --min-examples 4 --gate-z 0.5 &
     python3 scripts/demo_online.py http://127.0.0.1:8080
 
 Teaches a severity scale with labelled tickets via /v1/examples, then compares
 held-out accuracy of the base model (the prequential "base" answer) with the
-adapted answer. Resets the task first so it can be re-run.
+adapted answer. Resets the task first so it can be re-run. With only 21 labels the
+adapter is ahead by less than the default gate (--gate-z 0.8) requires, so the demo
+lowers it; see "Online learning" in the README.
 """
 
 import json
@@ -91,5 +93,6 @@ print(f"taught {len(res)} labels; served loss first half {sum(losses[:len(losses
       f"second half {sum(losses[len(losses)//2:])/(len(losses)-len(losses)//2):.2f}")
 info = call("GET", f"/v1/tasks/{TASK}")
 print(f"adapter: active={info['active']} T={info['temperature']:.2f} "
-      f"prequential loss base={info['base_loss']:.3f} adapted={info['adapted_loss']:.3f}")
+      f"prequential loss base={info['base_loss']:.3f} adapted={info['adapted_loss']:.3f}, "
+      f"brier base={info['base_brier']:.3f} adapted={info['adapted_brier']:.3f}")
 print(f"adapted,    held-out accuracy: {accuracy(TEST, 0):.2f}")

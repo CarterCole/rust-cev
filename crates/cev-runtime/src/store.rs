@@ -8,6 +8,7 @@
 //!
 //! In the browser (`wasm32`) the same API is backed by memory instead.
 
+use crate::adapter::Adapter;
 use cev_core::{Label, OptionSpec, Question, QuestionType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -123,6 +124,18 @@ pub struct ExportFilter {
     /// Only rows decided/labelled at or after this unix-ms time.
     pub since: Option<i64>,
     pub limit: Option<usize>,
+}
+
+/// One stored adapter with the key it lives under, as exported to and
+/// imported from NDJSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterRow {
+    /// Backbone the adapter was fit on.
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    pub task: String,
+    pub adapter: Adapter,
 }
 
 #[derive(Debug, Clone, Serialize)]

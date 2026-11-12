@@ -144,6 +144,20 @@ impl Store {
             .collect())
     }
 
+    /// Every adapter of every model.
+    pub fn all_adapters(&self) -> Result<Vec<super::AdapterRow>> {
+        let s = self.inner.lock();
+        let mut rows: Vec<super::AdapterRow> = s
+            .adapters
+            .iter()
+            .filter_map(|((model, namespace, task), d)| {
+                serde_json::from_str(d).ok().map(|adapter| super::AdapterRow { model: model.clone(), namespace: namespace.clone(), task: task.clone(), adapter })
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.model, &a.namespace, &a.task).cmp(&(&b.model, &b.namespace, &b.task)));
+        Ok(rows)
+    }
+
     pub fn delete_adapter(&self, model: &str, namespace: &str, task: &str) -> Result<bool> {
         Ok(self.inner.lock().adapters.remove(&(model.to_string(), namespace.to_string(), task.to_string())).is_some())
     }

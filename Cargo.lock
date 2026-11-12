@@ -607,6 +607,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "cev-core",
+ "half",
  "indexmap",
  "parking_lot",
  "rusqlite",

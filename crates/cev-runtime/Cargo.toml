@@ -23,6 +23,7 @@ web-time.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite.workspace = true
+half = "2"
 
 [dev-dependencies]
 base64 = "0.22"

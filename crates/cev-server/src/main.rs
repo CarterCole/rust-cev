@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use cev_core::{Backend, MockBackend};
 use cev_model::EngineOptions;
-use cev_runtime::{Cev, LearnConfig, RuntimeConfig, Store};
+use cev_runtime::{AdapterRow, Cev, LearnConfig, RuntimeConfig, Store};
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 /// cev: typed System One decisions with feedback and online learning.
@@ -51,6 +52,10 @@ struct Args {
     /// Labels before an adapter may be served.
     #[arg(long, env = "CEV_MIN_EXAMPLES", default_value_t = 8)]
     min_examples: u64,
+    /// How many standard errors ahead of the base model an adapter must be
+    /// before it is served. 0 serves any adapter that is ahead on average.
+    #[arg(long, env = "CEV_GATE_Z", default_value_t = 0.8)]
+    gate_z: f64,
     /// Position-bias correction: auto | none | calibrate | permute | full.
     /// `auto` is the model family's default: `full` for zero-shot code
     /// readouts (plain Qwen checkpoints), `none` for trained decision models.
@@ -66,6 +71,65 @@ struct Args {
     /// Use a keyword-matching mock instead of a neural backbone (for wiring tests).
     #[arg(long)]
     mock: bool,
+    /// Write every stored adapter as NDJSON to FILE (`-` for stdout), then exit.
+    #[arg(long, value_name = "FILE")]
+    export_adapters: Option<String>,
+    /// Load adapters from an NDJSON FILE written by --export-adapters (`-` for
+    /// stdin) as starting points for this backbone, then exit. They are not
+    /// served until they beat the base model on new labels.
+    #[arg(long, value_name = "FILE")]
+    import_adapters: Option<String>,
+    /// With --import-adapters: only take adapters fit on this model id. Needed
+    /// when the file mixes several.
+    #[arg(long, value_name = "MODEL")]
+    import_from: Option<String>,
+    /// With --import-adapters: replace adapters that already exist.
+    #[arg(long)]
+    import_overwrite: bool,
+}
+
+fn export_adapters(db: &str, path: &str) -> Result<()> {
+    if !std::path::Path::new(db).exists() {
+        anyhow::bail!("no database at {db}");
+    }
+    let rows = Store::open(db)?.all_adapters()?;
+    let mut out: Box<dyn Write> = if path == "-" { Box::new(std::io::stdout().lock()) } else { Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)) };
+    for row in &rows {
+        serde_json::to_writer(&mut out, row)?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    eprintln!("exported {} adapters", rows.len());
+    Ok(())
+}
+
+fn read_adapter_rows(path: &str, from: Option<&str>) -> Result<Vec<AdapterRow>> {
+    let text = if path == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(path)?
+    };
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        rows.push(serde_json::from_str::<AdapterRow>(line).map_err(|e| anyhow::anyhow!("{path}:{}: {e}", i + 1))?);
+    }
+    match from {
+        Some(model) => rows.retain(|r| r.model == model),
+        None => {
+            let mut models: Vec<&str> = rows.iter().map(|r| r.model.as_str()).collect();
+            models.sort_unstable();
+            models.dedup();
+            if models.len() > 1 {
+                anyhow::bail!("{path} holds adapters from {} models ({}); pick one with --import-from", models.len(), models.join(", "));
+            }
+        }
+    }
+    if rows.is_empty() {
+        anyhow::bail!("no adapters to import from {path}");
+    }
+    Ok(rows)
 }
 
 #[tokio::main]
@@ -74,6 +138,10 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tower_http=info".into()))
         .init();
     let args = Args::parse();
+    if let Some(path) = &args.export_adapters {
+        return export_adapters(&args.db, path);
+    }
+    let import_rows = args.import_adapters.as_deref().map(|path| read_adapter_rows(path, args.import_from.as_deref())).transpose()?;
     let backend: Arc<dyn Backend> = if args.mock {
         Arc::new(MockBackend::default())
     } else {
@@ -92,12 +160,17 @@ async fn main() -> Result<()> {
     let cfg = RuntimeConfig {
         online_learning: !args.no_online_learning,
         store_features: !args.no_store_features,
-        learn: LearnConfig { min_examples: args.min_examples, ..Default::default() },
+        learn: LearnConfig { min_examples: args.min_examples, gate_z: args.gate_z, ..Default::default() },
         debias: serde_json::from_value(serde_json::Value::String(args.debias.clone()))
             .map_err(|_| anyhow::anyhow!("--debias must be auto, none, calibrate, permute or full"))?,
         max_permutations: args.max_permutations,
     };
     let cev = Cev::new(backend, Store::open(&args.db)?, cfg)?;
+    if let Some(rows) = import_rows {
+        let stats = cev.import_adapters(&rows, args.import_overwrite)?;
+        println!("{}", serde_json::to_string(&stats)?);
+        return Ok(());
+    }
     if let Some(dir) = &args.web {
         anyhow::ensure!(dir.join("index.html").is_file(), "--web {}: no index.html there", dir.display());
     }

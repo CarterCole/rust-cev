@@ -131,6 +131,8 @@ pub struct Task {
     pub temperature: f32,
     pub base_loss: f64,
     pub adapted_loss: f64,
+    pub base_brier: f64,
+    pub adapted_brier: f64,
 }
 
 impl From<cev_runtime::TaskInfo> for Task {
@@ -144,6 +146,8 @@ impl From<cev_runtime::TaskInfo> for Task {
             temperature: t.temperature,
             base_loss: t.base_loss,
             adapted_loss: t.adapted_loss,
+            base_brier: t.base_brier,
+            adapted_brier: t.adapted_brier,
         }
     }
 }

@@ -1,0 +1,42 @@
+{"kind": "severity", "text": "The logo on the invoice PDF is slightly blurry.", "level": 0}
+{"kind": "severity", "text": "Typo on the pricing page: 'recieve' should be 'receive'.", "level": 0}
+{"kind": "severity", "text": "The settings icon is misaligned by a few pixels on Android.", "level": 0}
+{"kind": "severity", "text": "Dark mode makes the footer text a little hard to read.", "level": 0}
+{"kind": "severity", "text": "The confirmation email uses the old brand color.", "level": 0}
+{"kind": "severity", "text": "Tooltip on the export button has a spelling mistake.", "level": 0}
+{"kind": "severity", "text": "Profile avatars look stretched on the team page.", "level": 0}
+{"kind": "severity", "text": "The loading spinner is off-center on Safari.", "level": 0}
+{"kind": "severity", "text": "Button labels are in title case instead of sentence case.", "level": 0}
+{"kind": "severity", "text": "The date in the footer shows last year.", "level": 0}
+{"kind": "severity", "text": "CSV export is slow but finishes after a minute or two.", "level": 1}
+{"kind": "severity", "text": "Search sometimes misses results; filtering by date manually works.", "level": 1}
+{"kind": "severity", "text": "Push notifications are delayed by about 10 minutes.", "level": 1}
+{"kind": "severity", "text": "I can't upload images by drag and drop, but the upload button works.", "level": 1}
+{"kind": "severity", "text": "The dashboard charts fail to load on Firefox; Chrome is fine.", "level": 1}
+{"kind": "severity", "text": "Password reset emails take a while; retrying eventually works.", "level": 1}
+{"kind": "severity", "text": "Keyboard shortcuts stopped working, I use the menu instead.", "level": 1}
+{"kind": "severity", "text": "Autosave fails sometimes, so I save manually every few minutes.", "level": 1}
+{"kind": "severity", "text": "The mobile app logs me out daily; logging back in works.", "level": 1}
+{"kind": "severity", "text": "Bulk edit is broken, but editing items one by one still works.", "level": 1}
+{"kind": "severity", "text": "The app crashes immediately on launch for every user in our org.", "level": 2}
+{"kind": "severity", "text": "Checkout returns a 500 error; no customer can pay right now.", "level": 2}
+{"kind": "severity", "text": "All our data disappeared from the dashboard after the update.", "level": 2}
+{"kind": "severity", "text": "Login is down for everyone; we are completely locked out.", "level": 2}
+{"kind": "severity", "text": "The API returns errors for every request; our integration is dead.", "level": 2}
+{"kind": "severity", "text": "Payments are being charged twice and we can't stop it.", "level": 2}
+{"kind": "severity", "text": "The server won't start after the upgrade; production is down.", "level": 2}
+{"kind": "severity", "text": "Files uploaded yesterday are corrupted and can't be opened at all.", "level": 2}
+{"kind": "severity", "text": "Nobody can send messages; the send button does nothing on any device.", "level": 2}
+{"kind": "severity", "text": "The database migration failed and the app shows a blank page.", "level": 2}
+{"kind": "route", "text": "I was charged twice for my subscription, please refund.", "team": "billing"}
+{"kind": "route", "text": "My invoice shows the wrong VAT number.", "team": "billing"}
+{"kind": "route", "text": "Can I get a receipt for last month's payment?", "team": "billing"}
+{"kind": "route", "text": "Cancel my plan and refund the unused days.", "team": "billing"}
+{"kind": "route", "text": "The app crashes when I open settings.", "team": "tech"}
+{"kind": "route", "text": "Error 500 when saving a document.", "team": "tech"}
+{"kind": "route", "text": "Sync stopped working after the update.", "team": "tech"}
+{"kind": "route", "text": "The export button does nothing.", "team": "tech"}
+{"kind": "route", "text": "How much is the enterprise plan for 200 seats?", "team": "sales"}
+{"kind": "route", "text": "Do you offer discounts for nonprofits?", "team": "sales"}
+{"kind": "route", "text": "I'd like to upgrade to the Pro plan.", "team": "sales"}
+{"kind": "route", "text": "Can we get a demo for our sales team?", "team": "sales"}

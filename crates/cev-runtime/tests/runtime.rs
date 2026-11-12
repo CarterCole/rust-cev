@@ -238,3 +238,103 @@ fn backend_input_errors_are_bad_requests() {
     let internal: CevError = anyhow::anyhow!("device lost").into();
     assert!(matches!(internal, CevError::Internal(_)));
 }
+
+/// Teach a fresh service that invoices are "tech", the opposite of the mock.
+fn teach_tech(cev: &Cev, namespace: &str, n: usize) {
+    let texts = ["invoices broken", "invoices missing", "invoices late", "invoices doubled", "invoices wrong total"];
+    for i in 0..n {
+        let r = cev.decide(&in_namespace(texts[i % texts.len()], namespace)).unwrap();
+        cev.feedback(&label(&decision_id(&r.answers["team"]), Label::Text("tech".into()))).unwrap();
+    }
+}
+
+#[test]
+fn adapters_move_between_databases_and_earn_activation_again() {
+    let src = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    teach_tech(&src, "acme", 30);
+    assert!(src.task("acme", "router").unwrap().active);
+
+    // Through NDJSON, as the command line does it.
+    let lines: Vec<String> = src.store().all_adapters().unwrap().iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+    assert_eq!(lines.len(), 1);
+    let rows: Vec<cev_runtime::AdapterRow> = lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!((rows[0].namespace.as_str(), rows[0].task.as_str()), ("acme", "router"));
+
+    // Same backbone, empty database: prior knowledge arrives but is not served.
+    let dst = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let stats = dst.import_adapters(&rows, false).unwrap();
+    assert_eq!((stats.imported, stats.skipped, stats.probe_reset), (1, 0, 0));
+    let t = dst.task("acme", "router").unwrap();
+    assert!(!t.active && t.examples == 0, "{t:?}");
+    assert_eq!(t.temperature, src.task("acme", "router").unwrap().temperature);
+    let r = dst.decide(&in_namespace("invoices broken", "acme")).unwrap();
+    let Answer::Choice { choice, .. } = &r.answers["team"] else { panic!() };
+    assert_eq!(choice, "billing");
+
+    // It is persisted, and it re-earns activation from new labels.
+    assert_eq!(dst.store().all_adapters().unwrap().len(), 1);
+    teach_tech(&dst, "acme", 12);
+    assert!(dst.task("acme", "router").unwrap().active);
+
+    // Existing adapters are kept unless asked otherwise.
+    let again = dst.import_adapters(&rows, false).unwrap();
+    assert_eq!((again.imported, again.skipped), (0, 1));
+    assert!(dst.task("acme", "router").unwrap().active);
+    let forced = dst.import_adapters(&rows, true).unwrap();
+    assert_eq!(forced.imported, 1);
+    assert!(!dst.task("acme", "router").unwrap().active);
+
+    // A backbone with a different hidden size keeps priors but restarts the probe.
+    let small = Cev::new(Arc::new(MockBackend::new(32)), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let stats = small.import_adapters(&rows, false).unwrap();
+    assert_eq!((stats.imported, stats.probe_reset), (1, 1));
+    teach_tech(&small, "acme", 12);
+    assert!(small.task("acme", "router").unwrap().active);
+}
+
+#[test]
+fn hidden_states_are_stored_as_half_floats_and_old_rows_still_read() {
+    let dir = std::env::temp_dir().join(format!("cev-f16-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("cev.db");
+    let _ = std::fs::remove_file(&db);
+    {
+        // A database from before half floats: namespaces exist, the dtype column does not.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, question_id TEXT NOT NULL,
+                 model TEXT NOT NULL, task TEXT NOT NULL, kind TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL,
+                 codes TEXT NOT NULL, suffix TEXT NOT NULL, base_logits BLOB NOT NULL, served TEXT NOT NULL,
+                 adapted INTEGER NOT NULL, hidden BLOB, created_at INTEGER NOT NULL, namespace TEXT NOT NULL DEFAULT '',
+                 UNIQUE (request_id, question_id));
+             INSERT INTO decisions VALUES ('dec_old', 'req_old', 'q', 'cev-mock', 't', 'noul',
+                 '{\"type\":\"noul\",\"instructions\":\"x\"}', '[]', '[]', '', X'', '[]', 0, X'0000803F000000C0', 1, '');",
+        )
+        .unwrap();
+    }
+    let backend = Arc::new(MockBackend::default());
+    let cev = Cev::new(backend, Store::open(&db).unwrap(), RuntimeConfig::default()).unwrap();
+    // The old full-float row reads back exactly: [1.0, -2.0].
+    let old = cev.store().decision("dec_old").unwrap().unwrap();
+    assert_eq!(old.hidden.as_deref(), Some(&[1.0, -2.0][..]));
+
+    // New rows hold half the bytes and come back to within half-float precision.
+    let r = cev.decide(&request("invoices broken")).unwrap();
+    let id = decision_id(&r.answers["team"]);
+    let stored = cev.store().decision(&id).unwrap().unwrap().hidden.unwrap();
+    assert_eq!(stored.len(), 64);
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let (bytes, dtype): (i64, String) = c.query_row("SELECT length(hidden), hidden_dtype FROM decisions WHERE decision_id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((bytes, dtype.as_str()), (128, "f16"));
+    let (old_bytes, old_dtype): (i64, String) = c.query_row("SELECT length(hidden), hidden_dtype FROM decisions WHERE decision_id = 'dec_old'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((old_bytes, old_dtype.as_str()), (8, "f32"));
+
+    // Learning from a stored half-float row works end to end.
+    for i in 0..12 {
+        let r = cev.decide(&request(&format!("invoices late {i}"))).unwrap();
+        cev.feedback(&label(&decision_id(&r.answers["team"]), Label::Text("tech".into()))).unwrap();
+    }
+    assert!(cev.task("", "router").unwrap().active);
+    drop(c);
+    let _ = std::fs::remove_dir_all(dir);
+}

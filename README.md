@@ -111,6 +111,18 @@ Zero-shot accuracy on small built-in tasks (`scripts/eval_zero_shot.py`):
 | calibrate | 0.77 | 0.80 | 0.92 |
 | full | **0.80** | **0.97** | **0.92** |
 
+Debiasing matters as much for calibration as for accuracy. Over the same 72 answers (42 items in `eval/items.jsonl`), pooled, with expected calibration error (ECE) over 15 equal-width bins on the top probability:
+
+| | log loss | Brier | ECE |
+|---|---:|---:|---:|
+| Qwen3-1.7B, none | 6.871 | 0.846 | 0.424 |
+| Qwen3-1.7B, calibrate | 0.685 | 0.315 | 0.147 |
+| Qwen3-1.7B, full | **0.291** | **0.173** | **0.052** |
+| Qwen3-0.6B, none | 1.741 | 0.650 | 0.244 |
+| Qwen3-0.6B, full | **0.508** | **0.304** | **0.099** |
+
+That is a small set, so read it as direction, not a benchmark. `scripts/eval_zero_shot.py` prints these against a running server. `cargo test --release -p cev-server --test zero_shot -- --ignored --nocapture` prints the same numbers in-process, and `CEV_EVAL_MODEL` picks the model.
+
 ### Online learning
 
 The backbone stays frozen. Each task gets a residual layer, keyed by `task`, which is either given explicitly or derived from the type, instructions, and option names:
@@ -123,7 +135,9 @@ z'_k = z_k · e^{-τ} + b_k + w_k · x,     x = standardize(h)/√d
 - `b` learns label priors.
 - `w` is a linear probe on the backbone's own representation of the question.
 
-At zero, the layer is exactly the base model. After each label, cev refits over a replay buffer of recent labels (SGD warm start). It serves the adapter only once it beats the base model prequentially. That means every label is scored by both the base model and the adapter *before* either learns from it, so the comparison is always on unseen data. `GET /v1/tasks` shows both losses.
+At zero, the layer is exactly the base model. After each label, cev refits over a replay buffer of recent labels (SGD warm start). It serves the adapter only once it beats the base model prequentially. That means every label is scored by both the base model and the adapter *before* either learns from it, so the comparison is always on unseen data. `GET /v1/tasks` shows both log losses and both Brier scores.
+
+"Beats" is a significance test, not a comparison of two averages. cev keeps the last 64 per-label loss gaps (adapter minus base) and serves the adapter once their mean is below minus `--gate-z` standard errors (default 0.8), after at least `--min-examples` labels. On labels that carry no signal, the old rule of comparing two decayed averages switched a useless adapter on 35% of the time after 8 labels and about 20% after 16 to 64. Measured at `--gate-z 1`, the test brings that to 14% after 8 and 1–5% after 16 or more, and on a real signal it switches on after about 22 labels instead of 11. The default of 0.8 sits between that and `--gate-z 0`; its rates were not measured separately. `--gate-z 0` serves any adapter that is ahead on average.
 
 #### Namespaces
 
@@ -140,8 +154,20 @@ Measured with a 3-level severity scale (`scripts/demo_online.py`):
 - **Raw Qwen3-0.6B** (`--debias none`). 21 labels raised held-out accuracy from 0.33 to 0.89. The adapter learned T = 2.47, so the raw model was overconfident.
 - **Offline LoRA fine-tune.** The same 21 labels (`training/train_lora.py`), served back through cev, reached 1.00.
 - **Debiased Qwen3-1.7B.** The base model was already at 0.89, and the adapter correctly stayed inactive because it did not beat the base prequentially (0.528 vs 0.509 loss). The gate prevents regressions.
+- **Debiased Qwen3-0.6B, gate sensitivity.** After 21 labels the adapter was slightly ahead (loss 0.78 vs 0.83) but not by more than the noise. At `--gate-z 1` or the default 0.8 it stayed off and held-out accuracy stayed at 0.67. At `--gate-z 0.5` or `0` it was served and held-out accuracy reached 1.00. Use a lower `--gate-z` when labels are scarce and a wrong adapter is cheap, and keep the default when it is not.
 
 The held-out set is only 9 tickets from the same distribution, so treat these as tests of the loop, not benchmarks.
+
+#### Moving adapters
+
+An adapter is small (tens of kilobytes) and can be exported and imported as NDJSON:
+
+```bash
+cev --db cev.db --export-adapters adapters.ndjson          # every adapter, every model; "-" is stdout
+cev --db other.db --model Qwen/Qwen3-1.7B --import-adapters adapters.ndjson
+```
+
+Import loads the model, saves the adapters under its id, and exits. A file that mixes several source models needs `--import-from <model id>`, and tasks that already have an adapter are kept unless you pass `--import-overwrite`. Imported adapters start with no evidence: they are not served until they beat the base model on labels received in the new database, so a pack from elsewhere can't make answers worse. The temperature and per-option biases depend only on the option logits and names, so they carry to any backbone. The probe weights carry only to the same hidden size, and are restarted otherwise. This is also how to keep adapters across a new fine-tuned checkpoint, which has a different model id.
 
 ### Offline training (PyTorch)
 
@@ -182,8 +208,13 @@ Other flags:
 | `--allowed-host` | loopback names on a loopback `--addr`, else any | Host names the server answers to (repeat, or comma-separate `CEV_ALLOWED_HOSTS`; `*` for any). Stops DNS-rebinding pages from reading the API |
 | `--web` | none | Serve the browser page from this directory (`web/`) at `/`; the page sends no token, so it needs a server without `--api-key` |
 | `--no-online-learning` | off | Only store labels; don't adapt |
-| `--no-store-features` | off | Don't store hidden states |
+| `--no-store-features` | off | Don't store hidden states (they are stored as half floats) |
 | `--min-examples` | 8 | Labels needed before an adapter can be served |
+| `--gate-z` | 0.8 | Standard errors an adapter must lead the base model by to be served |
+| `--export-adapters` | none | Write every stored adapter as NDJSON to a file (`-` for stdout) and exit |
+| `--import-adapters` | none | Load adapters from such a file into the loaded model and exit |
+| `--import-from` | none | With import: only adapters fit on this model id |
+| `--import-overwrite` | off | With import: replace adapters that already exist |
 | `--debias` | `auto` | Debias mode: `auto`, `none`, `calibrate`, `permute` or `full` |
 
 Each flag has a matching `CEV_*` environment variable.
