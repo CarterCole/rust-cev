@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/cev","crates/cev-core", "crates/cev-derive", "crates/cev-model", "crates/cev-runtime", "crates/cev-server", "crates/cev-wasm"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/CarterCole/rust-cev"
@@ -12,11 +12,11 @@ keywords = ["llm", "classification", "inference", "qwen", "candle"]
 categories = ["artificial-intelligence"]
 
 [workspace.dependencies]
-cev-core = { path = "crates/cev-core", version = "0.2.2" }
-cev-model = { path = "crates/cev-model", version = "0.2.2" }
-cev-runtime = { path = "crates/cev-runtime", version = "0.2.2" }
-cev-derive = { path = "crates/cev-derive", version = "0.2.2" }
-cev-server = { path = "crates/cev-server", version = "0.2.2" }
+cev-core = { path = "crates/cev-core", version = "0.3.0" }
+cev-model = { path = "crates/cev-model", version = "0.3.0" }
+cev-runtime = { path = "crates/cev-runtime", version = "0.3.0" }
+cev-derive = { path = "crates/cev-derive", version = "0.3.0" }
+cev-server = { path = "crates/cev-server", version = "0.3.0" }
 
 anyhow = "1"
 thiserror = "2"
