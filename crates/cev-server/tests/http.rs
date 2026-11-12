@@ -154,3 +154,54 @@ async fn serves_the_page_and_takes_big_media() {
     assert_eq!(s, StatusCode::OK, "{r}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+async fn raw(app: &axum::Router, req: Request<Body>) -> StatusCode {
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn graphql_refuses_cross_site_simple_posts() {
+    let app = app(None);
+    let body = json!({"query": "mutation { resetTask(name: \"t\") }"}).to_string();
+    // What a web page can send without a CORS preflight.
+    for ct in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"] {
+        let req = Request::post("/graphql").header("content-type", ct).body(Body::from(body.clone())).unwrap();
+        assert_eq!(raw(&app, req).await, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct}");
+    }
+    let req = Request::post("/graphql").body(Body::from(body.clone())).unwrap();
+    assert_eq!(raw(&app, req).await, StatusCode::UNSUPPORTED_MEDIA_TYPE, "no content type");
+    let req = Request::post("/graphql").header("content-type", "application/json; charset=utf-8").body(Body::from(body)).unwrap();
+    assert_eq!(raw(&app, req).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn host_pinning_blocks_dns_rebinding() {
+    let cev = Cev::new(Arc::new(MockBackend::default()), Store::in_memory().unwrap(), RuntimeConfig::default()).unwrap();
+    let state = cev_server::AppState::new(cev, 1, None).with_allowed_hosts(cev_server::LOOPBACK_HOSTS.map(String::from));
+    let app = cev_server::app(state);
+    for (host, want) in [
+        ("localhost:8080", StatusCode::OK),
+        ("LOCALHOST", StatusCode::OK),
+        ("127.0.0.1:8080", StatusCode::OK),
+        ("[::1]:8080", StatusCode::OK),
+        ("[::1]", StatusCode::OK),
+        ("rebind.example.com:8080", StatusCode::FORBIDDEN),
+        ("127.0.0.1.example.com", StatusCode::FORBIDDEN),
+    ] {
+        let req = Request::get("/v1/decisions").header("host", host).body(Body::empty()).unwrap();
+        assert_eq!(raw(&app, req).await, want, "{host}");
+    }
+}
+
+#[tokio::test]
+async fn graphql_body_is_capped() {
+    let app = app(None);
+    let pad = "a".repeat(cev_server::MAX_BODY_BYTES);
+    let body = format!(r#"{{"query":"{{ model {{ id }} }}","variables":{{"pad":"{pad}"}}}}"#);
+    // Declared up front: refused before the body is read.
+    let req = Request::post("/graphql").header("content-type", "application/json").header("content-length", body.len()).body(Body::from(body.clone())).unwrap();
+    assert_eq!(raw(&app, req).await, StatusCode::PAYLOAD_TOO_LARGE);
+    // Streamed without a length: the read stops at the cap and fails.
+    let req = Request::post("/graphql").header("content-type", "application/json").body(Body::from(body)).unwrap();
+    assert!(raw(&app, req).await.is_client_error());
+}

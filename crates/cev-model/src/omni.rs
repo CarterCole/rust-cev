@@ -267,7 +267,10 @@ impl OmniEngine {
     }
 
     /// `prompt.encode`: the record's ids and marker positions within a token budget.
-    fn row(&self, parts: &Parts, q: &CompiledQuestion, max_len: usize) -> Result<Row> {
+    ///
+    /// `state_memo` memoizes the state's tokens: every question shares the
+    /// state, and re-encoding a large one per row was the expensive part.
+    fn row(&self, parts: &Parts, q: &CompiledQuestion, max_len: usize, state_memo: &mut Option<(String, Vec<u32>)>) -> Result<Row> {
         let k = parts.options.len();
         let (block, per) = prompt::budget(k, max_len, 24);
         let mut question = vec![self.ids.question];
@@ -286,8 +289,10 @@ impl OmniEngine {
         question.push(self.ids.decide);
         let room = max_len.saturating_sub(question.len() + 2);
         let mut state_ids = vec![self.ids.state];
-        let mut st = self.encode(&parts.state)?;
-        st.truncate(room);
+        if state_memo.as_ref().is_none_or(|(text, _)| *text != parts.state) {
+            *state_memo = Some((parts.state.clone(), self.encode(&parts.state)?));
+        }
+        let st = state_memo.as_ref().map(|(_, ids)| ids[..ids.len().min(room)].to_vec()).unwrap_or_default();
         state_ids.extend(st);
         let mut ids = vec![self.ids.bos];
         ids.extend(&state_ids);
@@ -295,7 +300,7 @@ impl OmniEngine {
         ids.truncate(max_len);
         let markers: Vec<usize> = markers.iter().map(|m| m + 1 + state_ids.len()).collect();
         if markers.last().is_some_and(|&m| m >= max_len) {
-            bail!("question `{}`: the options do not fit in the context", q.id);
+            return Err(cev_core::InputError(format!("question `{}`: the options do not fit in the context", q.id)).into());
         }
         Ok(Row { ids, markers, text: prompt::suffix(parts), kind: q.kind, k })
     }
@@ -330,9 +335,10 @@ impl Backend for OmniEngine {
         };
         let max_len = budget.min(self.cfg.max_length.saturating_sub(p)).min(self.opts.max_context);
         if max_len < 64 {
-            bail!("the media take {p} of the {} positions; send fewer images", self.cfg.max_length);
+            return Err(cev_core::InputError(format!("the media take {p} of the {} positions; send fewer images", self.cfg.max_length)).into());
         }
-        let rows: Vec<Row> = req.questions.iter().map(|q| self.row(&prompt::parts(req, q, mode), q, max_len)).collect::<Result<_>>()?;
+        let mut state_memo = None;
+        let rows: Vec<Row> = req.questions.iter().map(|q| self.row(&prompt::parts(req, q, mode), q, max_len, &mut state_memo)).collect::<Result<_>>()?;
         let d = self.hidden_size();
         let dev = self.trunk.device();
         let text_len = rows.iter().map(|r| r.ids.len()).max().unwrap_or(0);

@@ -4,6 +4,7 @@
 use crate::hub;
 use crate::qwen3::{Config, LayerKv, PrefixKv, Qwen3, Tensors};
 use anyhow::{Context, Result, bail};
+use cev_core::InputError;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use cev_core::prompt::cev as prompt;
@@ -333,6 +334,10 @@ impl Engine {
         // token prefix shared with the prefix text, so BPE merges across the
         // boundary can never change what the model sees.
         let prefix_ids = self.encode(&prefix_text)?;
+        // Refuse an oversized prompt before tokenizing it once per question
+        // (and per option rotation): that repetition is what makes a huge
+        // state expensive.
+        check_fits(prefix_ids.len(), suffix_text.iter().map(|s| self.encode(s).map(|t| t.len())), self.model.max_len)?;
         let fulls: Vec<Vec<u32>> = suffix_text.iter().map(|s| self.encode(&format!("{prefix_text}{s}"))).collect::<Result<_>>()?;
         let split = fulls.iter().map(|f| lcp(&prefix_ids, f)).min().unwrap_or(0).min(prefix_ids.len());
         let split = split.min(fulls.iter().map(|f| f.len() - 1).min().unwrap_or(0));
@@ -341,7 +346,7 @@ impl Engine {
         }
         let longest = fulls.iter().map(Vec::len).max().unwrap_or(0);
         if longest >= self.model.max_len {
-            bail!("prompt is {longest} tokens; the context limit is {}", self.model.max_len);
+            return Err(InputError(format!("prompt is {longest} tokens; the context limit is {}", self.model.max_len)).into());
         }
         let prefix = fulls[0][..split].to_vec();
         let cached = self.cache.lock().get(&prefix);
@@ -494,5 +499,40 @@ impl PrefixCache {
         while self.entries.iter().map(|(k, _)| k.len()).sum::<usize>() > self.budget {
             self.entries.remove(0);
         }
+    }
+}
+
+/// Tokens the shared prefix and a separately tokenized suffix may differ
+/// from their joint tokenization by (BPE merges across the boundary).
+const BOUNDARY_SLACK: usize = 8;
+
+/// Fail fast when the prefix, or the prefix plus any question's suffix,
+/// cannot fit in `max_len` tokens. Exact lengths are checked again on the
+/// joint tokenization; this only has to be cheap and never reject a prompt
+/// that fits.
+pub(crate) fn check_fits(prefix: usize, suffixes: impl Iterator<Item = Result<usize>>, max_len: usize) -> Result<()> {
+    if prefix >= max_len {
+        return Err(InputError(format!("prompt is at least {prefix} tokens; the context limit is {max_len}")).into());
+    }
+    for s in suffixes {
+        let total = prefix + s?;
+        if total > max_len + BOUNDARY_SLACK {
+            return Err(InputError(format!("prompt is about {total} tokens; the context limit is {max_len}")).into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn check_fits_rejects_early_and_allows_boundary_slack() {
+        let ok = |v: &[usize]| v.iter().map(|&n| Ok(n)).collect::<Vec<_>>().into_iter();
+        assert!(check_fits(100, ok(&[20, 30]), 128).is_ok());
+        assert!(check_fits(100, ok(&[30, 36]), 128).is_ok()); // within the slack
+        assert!(check_fits(100, ok(&[40]), 128).is_err());
+        assert!(check_fits(128, ok(&[1]), 128).is_err());
     }
 }

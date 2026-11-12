@@ -8,6 +8,6 @@ pub mod prompt;
 pub mod target;
 
 pub use api::*;
-pub use backend::{Backend, BackendOutput, Capabilities, MockBackend, Readout};
+pub use backend::{Backend, BackendOutput, Capabilities, InputError, MockBackend, Readout};
 pub use compile::{CompiledQuestion, CompiledRequest, Debias, Media, OptionSpec, compile, content_free};
 pub use prompt::{Family, PromptFormat};

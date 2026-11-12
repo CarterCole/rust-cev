@@ -38,7 +38,7 @@ tokenizers = { version = "0.22", default-features = false }
 
 tokio = { version = "1", features = ["full"] }
 axum = "0.8.9"
-tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 async-graphql = "7"
 async-graphql-axum = "7"
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -475,6 +475,7 @@ impl HybridEngine {
         // shared with the prefix text, so BPE merges across the boundary can
         // never change what the model sees.
         let prefix_ids = self.expand_pads(&self.encode(&prefix_text)?, &encoded);
+        crate::engine::check_fits(prefix_ids.len(), suffixes.iter().map(|(s, _)| self.encode(s).map(|t| t.len())), self.decoder.max_len())?;
         let fulls: Vec<Vec<u32>> = suffixes.iter().map(|(s, _)| Ok(self.expand_pads(&self.encode(&format!("{prefix_text}{s}"))?, &encoded))).collect::<Result<_>>()?;
         let split = fulls.iter().map(|f| lcp(&prefix_ids, f)).min().unwrap_or(0).min(prefix_ids.len());
         let split = split.min(fulls.iter().map(|f| f.len().saturating_sub(1)).min().unwrap_or(0));
@@ -483,7 +484,7 @@ impl HybridEngine {
         }
         let longest = fulls.iter().map(Vec::len).max().unwrap_or(0);
         if longest >= self.decoder.max_len() {
-            bail!("prompt is {longest} tokens; the context limit is {}", self.decoder.max_len());
+            return Err(cev_core::InputError(format!("prompt is {longest} tokens; the context limit is {}", self.decoder.max_len())).into());
         }
         // Image token runs inside the prefix take the features in order; the
         // whole prefix (images included) must be shared by every question.

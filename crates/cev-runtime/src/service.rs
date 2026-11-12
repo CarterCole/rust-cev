@@ -23,7 +23,19 @@ pub enum CevError {
     #[error("{0}")]
     NotFound(String),
     #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+/// Backend errors are internal unless they carry a [`cev_core::InputError`]:
+/// those were caused by the request and are the client's to fix.
+impl From<anyhow::Error> for CevError {
+    fn from(e: anyhow::Error) -> Self {
+        if e.chain().any(|c| c.is::<cev_core::InputError>()) {
+            CevError::BadRequest(format!("{e:#}"))
+        } else {
+            CevError::Internal(e)
+        }
+    }
 }
 
 pub type CevResult<T> = Result<T, CevError>;

@@ -18,6 +18,12 @@ pub const MAX_OPTIONS: usize = 255;
 pub const MAX_QUESTIONS: usize = 256;
 /// Largest decoded media payload per item.
 pub const MAX_MEDIA_BYTES: usize = 64 << 20;
+/// Most images per request. Each one runs through the vision tower before
+/// the prompt length is known, so this bounds that work.
+pub const MAX_IMAGES: usize = 16;
+/// Most text per request: the rendered state plus every question's
+/// instructions and criteria. About 1M tokens, past every supported context.
+pub const MAX_TEXT_BYTES: usize = 4 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -170,11 +176,22 @@ pub fn compile(req: &SystemOneRequest, max_options: usize) -> Result<CompiledReq
     if req.questions.len() > MAX_QUESTIONS {
         return Err(CompileError::Request(format!("at most {MAX_QUESTIONS} questions per request")));
     }
+    if req.images.len() > MAX_IMAGES {
+        return Err(CompileError::Request(format!("at most {MAX_IMAGES} images per request")));
+    }
     let media = Media {
         images: req.images.iter().enumerate().map(|(i, s)| decode_media(s, &format!("images[{i}]"))).collect::<Result<_, _>>()?,
         audio: req.audio.as_deref().map(|s| decode_media(s, "audio")).transpose()?,
     };
     let evidence = render_state(&req.state);
+    let question_bytes: usize = req
+        .questions
+        .iter()
+        .map(|(id, q)| id.len() + q.instructions.len() + q.task.as_ref().map_or(0, String::len) + q.criteria.as_ref().map_or(0, |c| c.to_string().len()))
+        .sum();
+    if evidence.len() + question_bytes > MAX_TEXT_BYTES {
+        return Err(CompileError::Request(format!("`state` and `questions` hold more than {} MB of text", MAX_TEXT_BYTES >> 20)));
+    }
     let max = max_options.min(MAX_OPTIONS);
     let mut questions = Vec::with_capacity(req.questions.len());
     for (id, q) in &req.questions {
@@ -402,6 +419,18 @@ mod tests {
         assert_eq!(c.questions[2].legend.as_ref().unwrap()["2"], "high");
         assert_eq!(c.questions[2].options[1].description.as_deref(), Some("mid"));
         assert!(c.media.is_empty());
+    }
+
+    #[test]
+    fn bounds_image_count_and_text() {
+        let q = json!({"q": {"type": "noul", "instructions": "x"}});
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfake");
+        let many = req(json!({"state": "s", "images": vec![png; MAX_IMAGES + 1], "questions": q}));
+        assert!(compile(&many, 26).unwrap_err().to_string().contains("images per request"));
+        let big = req(json!({"state": "a".repeat(MAX_TEXT_BYTES), "questions": q}));
+        assert!(compile(&big, 26).unwrap_err().to_string().contains("MB of text"));
+        let long_q = req(json!({"state": "s", "questions": {"q": {"type": "noul", "instructions": "a".repeat(MAX_TEXT_BYTES)}}}));
+        assert!(compile(&long_q, 26).is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! residual (LFM2-Audio lineage). One prefix embedding per 80 ms of audio.
 
 use anyhow::{Context, Result, bail};
+use cev_core::InputError;
 use candle_core::{D, DType, Device, Module, Result as CResult, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, linear, linear_no_bias};
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -11,22 +12,43 @@ use serde::Deserialize;
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MIN_SAMPLES: usize = 8_000;
 pub const MAX_SECONDS: usize = 30;
+/// Sample rates a WAV may declare (telephony to studio).
+pub const MIN_RATE: usize = 4_000;
+pub const MAX_RATE: usize = 192_000;
 
 /// Decode a WAV file to 16 kHz mono f32 in [-1, 1], cut to 30 s and padded
 /// to half a second.
+///
+/// Every failure here is the clip's fault, so it is an [`InputError`] (a 400).
 pub fn wav_to_16k_mono(bytes: &[u8]) -> Result<Vec<f32>> {
+    decode_wav(bytes).map_err(|e| InputError(format!("{e:#}")).into())
+}
+
+fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).context("cannot decode WAV")?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
+    let rate = spec.sample_rate as usize;
+    // The resampler's output length scales with 16 kHz / rate, so a header
+    // claiming 1 Hz would ask for gigabytes. Real recordings sit in here.
+    if !(MIN_RATE..=MAX_RATE).contains(&rate) {
+        bail!("WAV sample rate {rate} Hz is outside {MIN_RATE}..={MAX_RATE} Hz");
+    }
+    if !(1..=32).contains(&spec.bits_per_sample) {
+        bail!("WAV with {} bits per sample", spec.bits_per_sample);
+    }
+    // Only the first 30 s are heard: decode no more than that, plus a margin
+    // so the resampling window at the cut sees the same samples as before.
+    let keep = (MAX_SECONDS * rate + rate / 10) * channels;
     let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Float, _) => reader.samples::<f32>().collect::<std::result::Result<_, _>>()?,
+        (hound::SampleFormat::Float, _) => reader.samples::<f32>().take(keep).collect::<std::result::Result<_, _>>()?,
         (hound::SampleFormat::Int, bits) => {
             let scale = 1.0 / (1u64 << (bits - 1)) as f32;
-            reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<std::result::Result<_, _>>()?
+            reader.samples::<i32>().take(keep).map(|s| s.map(|v| v as f32 * scale)).collect::<std::result::Result<_, _>>()?
         }
     };
     let mono: Vec<f32> = samples.chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32).collect();
-    let mut x = if spec.sample_rate as usize == SAMPLE_RATE { mono } else { resample(&mono, spec.sample_rate as usize, SAMPLE_RATE) };
+    let mut x = if rate == SAMPLE_RATE { mono } else { resample(&mono, rate, SAMPLE_RATE) };
     x.truncate(MAX_SECONDS * SAMPLE_RATE);
     if x.len() < MIN_SAMPLES {
         x.resize(MIN_SAMPLES, 0.0);
@@ -437,6 +459,27 @@ fn _d(_: D) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wav(rate: u32, seconds: f32) -> Vec<u8> {
+        let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut w = hound::WavWriter::new(&mut buf, spec).unwrap();
+        for i in 0..(rate as f32 * seconds) as usize {
+            w.write_sample(((i as f32 * 0.01).sin() * 8000.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn rejects_absurd_sample_rates_and_caps_length() {
+        // 1 Hz would resample to 16,000 output samples per input sample.
+        assert!(wav_to_16k_mono(&wav(1, 1000.0)).unwrap_err().to_string().contains("sample rate"));
+        assert!(wav_to_16k_mono(&wav(1_000_000, 0.01)).is_err());
+        // A long clip is cut to 30 s, before and after resampling.
+        let x = wav_to_16k_mono(&wav(8_000, 40.0)).unwrap();
+        assert_eq!(x.len(), MAX_SECONDS * SAMPLE_RATE);
+    }
 
     #[test]
     fn mel_shapes_and_normalisation() {

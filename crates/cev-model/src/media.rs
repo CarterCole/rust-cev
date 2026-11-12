@@ -1,7 +1,8 @@
 //! Images and audio as the models take them: decoding, the resize rules of
 //! each family's processor, and patch / frame layouts.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use cev_core::InputError;
 use image::{DynamicImage, GenericImageView};
 
 /// Separable resampling weights of `F.interpolate(..., antialias=True)`:
@@ -108,14 +109,32 @@ impl Pixels {
 }
 
 /// Decode an encoded image (PNG, JPEG, WebP, GIF, BMP, TIFF) into RGB.
+///
+/// Sides are capped at [`MAX_IMAGE_SIDE`] (checked from the header, before
+/// the pixels are allocated) and the aspect ratio at [`MAX_ASPECT`], which
+/// keeps every resize buffer downstream in the hundreds of MB at most.
 pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage> {
-    let img = image::load_from_memory(bytes).context("cannot decode image")?;
+    let bad = |m: String| anyhow::Error::new(InputError(m));
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| bad(format!("cannot decode image: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| bad(format!("cannot decode image: {e}")))?;
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
-        bail!("empty image");
+        return Err(bad("empty image".into()));
+    }
+    if w.max(h) as f64 / w.min(h) as f64 > MAX_ASPECT {
+        return Err(bad(format!("image is {w}×{h}; the aspect ratio must be at most {MAX_ASPECT}")));
     }
     Ok(DynamicImage::ImageRgb8(img.to_rgb8()))
 }
+
+/// Longest side an input image may have (a 48 MP phone photo fits).
+pub const MAX_IMAGE_SIDE: u32 = 8192;
+/// Most elongated image accepted (Qwen-VL's processor has the same limit).
+pub const MAX_ASPECT: f64 = 200.0;
 
 /// Qwen-VL's `smart_resize`: both sides multiples of `factor`, the pixel
 /// count within `[min_pixels, max_pixels]`, the aspect ratio kept as closely
@@ -195,6 +214,20 @@ pub fn qwen_patches(img: &DynamicImage, p: &QwenImageParams) -> Result<QwenPatch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::GrayImage::new(w, h).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn decode_bounds_sides_and_aspect() {
+        assert!(decode_image(&png(64, 48)).is_ok());
+        assert!(decode_image(&png(1, 201)).unwrap_err().to_string().contains("aspect"));
+        // Rejected from the header, before 8193 × 8193 pixels are allocated.
+        assert!(decode_image(&png(MAX_IMAGE_SIDE + 1, MAX_IMAGE_SIDE + 1)).is_err());
+    }
 
     #[test]
     fn antialias_weights_match_torch() {

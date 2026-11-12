@@ -30,6 +30,12 @@ struct Args {
     db: String,
     #[arg(long, env = "CEV_ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
+    /// Host names the server answers to (repeat, or comma-separate in the
+    /// env var); `*` answers any. Default: on a loopback address only
+    /// localhost, 127.0.0.1 and [::1], which stops DNS-rebinding pages from
+    /// reading the API; on any other address, any host (set `--api-key`).
+    #[arg(long = "allowed-host", env = "CEV_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
     /// Require `Authorization: Bearer <key>`.
     #[arg(long, env = "CEV_API_KEY")]
     api_key: Option<String>,
@@ -95,8 +101,17 @@ async fn main() -> Result<()> {
     if let Some(dir) = &args.web {
         anyhow::ensure!(dir.join("index.html").is_file(), "--web {}: no index.html there", dir.display());
     }
-    let app = cev_server::app_serving(cev_server::AppState::new(cev, args.concurrency, args.api_key), args.web.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
+    let mut state = cev_server::AppState::new(cev, args.concurrency, args.api_key);
+    let hosts: Vec<String> = args.allowed_hosts.iter().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect();
+    if hosts.is_empty() {
+        if listener.local_addr()?.ip().is_loopback() {
+            state = state.with_allowed_hosts(cev_server::LOOPBACK_HOSTS.map(String::from));
+        }
+    } else if !hosts.iter().any(|h| h == "*") {
+        state = state.with_allowed_hosts(hosts);
+    }
+    let app = cev_server::app_serving(state, args.web.as_deref());
     match &args.web {
         Some(dir) => tracing::info!("listening on http://{} (page from {} at /, GraphiQL at /graphql)", args.addr, dir.display()),
         None => tracing::info!("listening on http://{} (GraphiQL at /graphql)", args.addr),

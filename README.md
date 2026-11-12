@@ -179,6 +179,7 @@ Other flags:
 | `--db` | `cev.db` | SQLite file for the decision log |
 | `--addr` | `127.0.0.1:8080` | Listen address |
 | `--api-key` | none | Require a bearer token on `/v1/*` and `/graphql` |
+| `--allowed-host` | loopback names on a loopback `--addr`, else any | Host names the server answers to (repeat, or comma-separate `CEV_ALLOWED_HOSTS`; `*` for any). Stops DNS-rebinding pages from reading the API |
 | `--web` | none | Serve the browser page from this directory (`web/`) at `/`; the page sends no token, so it needs a server without `--api-key` |
 | `--no-online-learning` | off | Only store labels; don't adapt |
 | `--no-store-features` | off | Don't store hidden states |
@@ -235,7 +236,7 @@ The page shows "On the cev server" when a server serves it, and still offers "In
 | server (Metal), a frame | 0.17 s |
 | in the tab, a frame | 12 s |
 
-Microphones and cameras need a secure context: `localhost` counts, a LAN address does not. The server accepts request bodies up to 96 MB, enough for 64 MB of media.
+Microphones and cameras need a secure context: `localhost` counts, a LAN address does not. The server accepts request bodies up to 96 MB (GraphQL included), enough for 64 MB of media. A request carries at most 16 images (each at most 8192 px a side, aspect ratio at most 200), WAV audio at 4–192 kHz, and 4 MB of state and question text. Malformed media and prompts past the context limit get a 400. GraphQL takes only `Content-Type: application/json` POSTs, so a web page cannot submit mutations to a local server cross-site.
 
 **int8.** `cev-model`'s `quantize` example writes an int8 copy of a checkpoint (per-row scales, inputs quantized to 13 bits at run time). It loads anywhere a model directory does (`cev --model <dir>`, CPU only), and the page offers it when it is in `web/models/`:
 

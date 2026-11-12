@@ -229,3 +229,12 @@ fn media_is_decoded_and_checked_against_the_backend() {
     let clip = SystemOneRequest { audio: Some(base64::engine::general_purpose::STANDARD.encode(b"RIFF....WAVE")), ..request("x") };
     assert!(cev.decide(&clip).unwrap_err().to_string().contains("`audio`"));
 }
+
+#[test]
+fn backend_input_errors_are_bad_requests() {
+    use cev_runtime::CevError;
+    let input: CevError = anyhow::Error::new(cev_core::InputError("image is 1×300".into())).context("images[0]").into();
+    assert!(matches!(&input, CevError::BadRequest(m) if m == "images[0]: image is 1×300"), "{input:?}");
+    let internal: CevError = anyhow::anyhow!("device lost").into();
+    assert!(matches!(internal, CevError::Internal(_)));
+}

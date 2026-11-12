@@ -3,6 +3,14 @@
 use crate::compile::{CompiledQuestion, CompiledRequest, Debias};
 use crate::prompt::{Family, PromptFormat, cev};
 
+/// A backend error caused by what the request carries (an undecodable or
+/// oversized image, a malformed WAV, a prompt past the context) rather than
+/// by the server. Return it (inside any `anyhow` context) and the runtime
+/// answers 400 with the message instead of a 500.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InputError(pub String);
+
 /// What the network produced for one question.
 #[derive(Debug, Clone)]
 pub struct Readout {
