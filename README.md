@@ -1,3 +1,5 @@
+![CEV](.github/banner.png)
+
 # cev
 
 **Calibrated Enum Verdicts.** Typed, calibrated decisions in one forward pass, served from Rust. It learns from feedback while it runs.
